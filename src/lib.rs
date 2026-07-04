@@ -34,6 +34,9 @@ use hop_core::store::{HaveSet, MemoryStore, Store};
 enum Op {
     Write { id: BundleId, data: Vec<u8>, expires_at: u64 },
     Delete { id: BundleId },
+    /// F-21: drain sentinel. The worker acks this AFTER processing every op ahead of it (mpsc is
+    /// FIFO), so `flush()` blocking on the ack means all pending mirrors have been attempted.
+    Flush(mpsc::SyncSender<()>),
 }
 
 /// Durable per-node store: in-memory hot path + Firestore mirror.
@@ -59,11 +62,17 @@ impl FirestoreStore {
         let (tx, rx) = mpsc::channel::<Op>();
         std::thread::spawn(move || {
             for op in rx {
+                // F-21: a flush sentinel just acks — everything before it in the FIFO is done.
+                if let Op::Flush(ack) = &op {
+                    let _ = ack.send(());
+                    continue;
+                }
                 // Best-effort with a couple of retries; the hot path never blocks here.
                 for attempt in 0..3 {
                     let ok = match &op {
                         Op::Write { id, data, expires_at } => client.put_bundle(id, data, *expires_at),
                         Op::Delete { id } => client.delete_bundle(id),
+                        Op::Flush(_) => break,
                     };
                     if ok.is_ok() {
                         break;
@@ -144,6 +153,16 @@ impl Store for FirestoreStore {
                 let _ = self.tx.send(Op::Write { id: *id, data, expires_at });
             }
         }
+    }
+
+    /// F-21: block until the background writer has drained every pending mirror (or `timeout`
+    /// elapses). The mpsc is FIFO, so an acked Flush means every prior Write/Delete was attempted.
+    fn flush(&self, timeout: std::time::Duration) -> bool {
+        let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(0);
+        if self.tx.send(Op::Flush(ack_tx)).is_err() {
+            return false; // worker already gone
+        }
+        ack_rx.recv_timeout(timeout).is_ok()
     }
 }
 
@@ -393,6 +412,8 @@ fn registry_doc_json(node: &str, region: &str, endpoint: &str, heartbeat_ms: u64
             "region": { "stringValue": region },
             "endpoint": { "stringValue": endpoint },
             "heartbeatAt": { "integerValue": heartbeat_ms.to_string() },
+            // F-20: timestampValue the Firestore TTL policy sweeps on, so stale registry rows self-expire.
+            "expireAt": { "timestampValue": rfc3339_utc(heartbeat_ms + PRESENCE_DOC_TTL_MS) },
         }
     })
 }
@@ -659,12 +680,20 @@ impl Presence {
 }
 
 /// Build a Firestore document body for a device presence record.
+/// How long after its last heartbeat a presence/registry doc is allowed to persist before the
+/// Firestore TTL sweeps it (F-20). A small multiple of the ~90s read-side staleness filter: the read
+/// path already ignores anything this old, so deletion cannot regress routing — it only stops the
+/// collection being an indefinitely-retained per-address→region location log (DESIGN §33).
+const PRESENCE_DOC_TTL_MS: u64 = 3_600_000; // 1h
+
 fn presence_doc_json(device: &str, region: &str, heartbeat_ms: u64) -> serde_json::Value {
     serde_json::json!({
         "fields": {
             "device": { "stringValue": device },
             "region": { "stringValue": region },
             "heartbeatAt": { "integerValue": heartbeat_ms.to_string() },
+            // F-20: timestampValue the Firestore TTL policy sweeps on, so presence self-expires.
+            "expireAt": { "timestampValue": rfc3339_utc(heartbeat_ms + PRESENCE_DOC_TTL_MS) },
         }
     })
 }
