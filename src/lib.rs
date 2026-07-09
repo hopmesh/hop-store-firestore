@@ -32,8 +32,14 @@ use hop_core::store::{HaveSet, MemoryStore, Store};
 
 /// A bundle write/delete to mirror to Firestore.
 enum Op {
-    Write { id: BundleId, data: Vec<u8>, expires_at: u64 },
-    Delete { id: BundleId },
+    Write {
+        id: BundleId,
+        data: Vec<u8>,
+        expires_at: u64,
+    },
+    Delete {
+        id: BundleId,
+    },
     /// F-21: drain sentinel. The worker acks this AFTER processing every op ahead of it (mpsc is
     /// FIFO), so `flush()` blocking on the ack means all pending mirrors have been attempted.
     Flush(mpsc::SyncSender<()>),
@@ -70,7 +76,11 @@ impl FirestoreStore {
                 // Best-effort with a couple of retries; the hot path never blocks here.
                 for attempt in 0..3 {
                     let ok = match &op {
-                        Op::Write { id, data, expires_at } => client.put_bundle(id, data, *expires_at),
+                        Op::Write {
+                            id,
+                            data,
+                            expires_at,
+                        } => client.put_bundle(id, data, *expires_at),
                         Op::Delete { id } => client.delete_bundle(id),
                         Op::Flush(_) => break,
                     };
@@ -95,7 +105,11 @@ impl Store for FirestoreStore {
             Err(_) => return false,
         };
         if self.inner.put(bundle, now_ms) {
-            let _ = self.tx.send(Op::Write { id, data, expires_at });
+            let _ = self.tx.send(Op::Write {
+                id,
+                data,
+                expires_at,
+            });
             true
         } else {
             false
@@ -137,8 +151,15 @@ impl Store for FirestoreStore {
         if give > 0 {
             if let Some(b) = self.inner.get(id) {
                 if let Ok(data) = b.to_bytes() {
-                    let expires_at = b.inner.created_at.saturating_add(b.inner.lifetime_ms as u64);
-                    let _ = self.tx.send(Op::Write { id: *id, data, expires_at });
+                    let expires_at = b
+                        .inner
+                        .created_at
+                        .saturating_add(b.inner.lifetime_ms as u64);
+                    let _ = self.tx.send(Op::Write {
+                        id: *id,
+                        data,
+                        expires_at,
+                    });
                 }
             }
         }
@@ -149,8 +170,15 @@ impl Store for FirestoreStore {
         self.inner.set_copies(id, copies);
         if let Some(b) = self.inner.get(id) {
             if let Ok(data) = b.to_bytes() {
-                let expires_at = b.inner.created_at.saturating_add(b.inner.lifetime_ms as u64);
-                let _ = self.tx.send(Op::Write { id: *id, data, expires_at });
+                let expires_at = b
+                    .inner
+                    .created_at
+                    .saturating_add(b.inner.lifetime_ms as u64);
+                let _ = self.tx.send(Op::Write {
+                    id: *id,
+                    data,
+                    expires_at,
+                });
             }
         }
     }
@@ -180,8 +208,9 @@ impl FirestoreClient {
     fn new(project: &str, node_addr: &[u8]) -> Self {
         let node = bs58::encode(node_addr).into_string();
         let base = "https://firestore.googleapis.com/v1";
-        let collection_url =
-            format!("{base}/projects/{project}/databases/(default)/documents/relays/{node}/bundles");
+        let collection_url = format!(
+            "{base}/projects/{project}/databases/(default)/documents/relays/{node}/bundles"
+        );
         Self {
             http: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(15))
@@ -220,7 +249,12 @@ impl FirestoreClient {
         let doc = bs58::encode(id).into_string();
         let url = format!("{}/{doc}", self.collection_url);
         let token = self.token()?;
-        let resp = self.http.delete(&url).bearer_auth(token).send().map_err(|e| e.to_string())?;
+        let resp = self
+            .http
+            .delete(&url)
+            .bearer_auth(token)
+            .send()
+            .map_err(|e| e.to_string())?;
         // 404 is fine — already gone.
         if resp.status().is_success() || resp.status().as_u16() == 404 {
             Ok(())
@@ -285,10 +319,16 @@ fn fetch_gcp_token(http: &reqwest::blocking::Client) -> Result<String, String> {
     // mints a token carrying the matching OAuth scope. `cloud-platform` covers every API the relay
     // touches (all of which are Firestore today) so we don't have to enumerate per-API scopes.
     let url = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform";
-    let resp =
-        http.get(url).header("Metadata-Flavor", "Google").send().map_err(|e| e.to_string())?;
+    let resp = http
+        .get(url)
+        .header("Metadata-Flavor", "Google")
+        .send()
+        .map_err(|e| e.to_string())?;
     let v: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
-    v["access_token"].as_str().map(|s| s.to_string()).ok_or_else(|| "no access_token".into())
+    v["access_token"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "no access_token".into())
 }
 
 /// A token with a ~50-minute cache (tokens last 1h).
@@ -363,8 +403,13 @@ impl Registry {
         let url = format!("{}/{}", self.collection_url, self.me);
         let body = registry_doc_json(&self.me, region, endpoint, now_ms);
         let token = self.token()?;
-        let resp =
-            self.http.patch(&url).bearer_auth(token).json(&body).send().map_err(|e| e.to_string())?;
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .map_err(|e| e.to_string())?;
         if resp.status().is_success() {
             Ok(())
         } else {
@@ -405,7 +450,12 @@ impl Registry {
 }
 
 /// Build a Firestore document body for a registry heartbeat.
-fn registry_doc_json(node: &str, region: &str, endpoint: &str, heartbeat_ms: u64) -> serde_json::Value {
+fn registry_doc_json(
+    node: &str,
+    region: &str,
+    endpoint: &str,
+    heartbeat_ms: u64,
+) -> serde_json::Value {
     serde_json::json!({
         "fields": {
             "node": { "stringValue": node },
@@ -423,7 +473,10 @@ fn parse_registry_doc(d: &serde_json::Value) -> Option<PeerInfo> {
     let f = d.get("fields")?;
     Some(PeerInfo {
         node: f["node"]["stringValue"].as_str()?.to_string(),
-        region: f["region"]["stringValue"].as_str().unwrap_or("").to_string(),
+        region: f["region"]["stringValue"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
         endpoint: f["endpoint"]["stringValue"].as_str()?.to_string(),
         heartbeat_ms: f["heartbeatAt"]["integerValue"]
             .as_str()
@@ -487,8 +540,13 @@ impl Presence {
         let url = format!("{}/{}", self.presence_url, device);
         let body = presence_doc_json(device, region, now_ms);
         let token = self.token()?;
-        let resp =
-            self.http.patch(&url).bearer_auth(token).json(&body).send().map_err(|e| e.to_string())?;
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .map_err(|e| e.to_string())?;
         if resp.status().is_success() {
             Ok(())
         } else {
@@ -506,7 +564,12 @@ impl Presence {
     ) -> Result<Option<String>, String> {
         let url = format!("{}/{}", self.presence_url, device);
         let token = self.token()?;
-        let resp = self.http.get(&url).bearer_auth(token).send().map_err(|e| e.to_string())?;
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .map_err(|e| e.to_string())?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
         }
@@ -538,8 +601,12 @@ impl Presence {
             if let Some(t) = &page_token {
                 url.push_str(&format!("&pageToken={t}"));
             }
-            let resp =
-                self.http.get(&url).bearer_auth(&token).send().map_err(|e| e.to_string())?;
+            let resp = self
+                .http
+                .get(&url)
+                .bearer_auth(&token)
+                .send()
+                .map_err(|e| e.to_string())?;
             if resp.status().as_u16() == 404 {
                 return Ok(out);
             }
@@ -580,8 +647,13 @@ impl Presence {
         );
         let body = doc_json(data, expires_at);
         let token = self.token()?;
-        let resp =
-            self.http.patch(&url).bearer_auth(token).json(&body).send().map_err(|e| e.to_string())?;
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .map_err(|e| e.to_string())?;
         if resp.status().is_success() {
             Ok(())
         } else {
@@ -611,8 +683,13 @@ impl Presence {
         );
         let body = doc_json(data, expires_at);
         let token = self.token()?;
-        let resp =
-            self.http.patch(&url).bearer_auth(token).json(&body).send().map_err(|e| e.to_string())?;
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .map_err(|e| e.to_string())?;
         if resp.status().is_success() {
             Ok(())
         } else {
@@ -636,8 +713,12 @@ impl Presence {
             if let Some(t) = &page_token {
                 url.push_str(&format!("&pageToken={t}"));
             }
-            let resp =
-                self.http.get(&url).bearer_auth(&token).send().map_err(|e| e.to_string())?;
+            let resp = self
+                .http
+                .get(&url)
+                .bearer_auth(&token)
+                .send()
+                .map_err(|e| e.to_string())?;
             if resp.status().as_u16() == 404 {
                 return Ok(out); // mailbox empty / never spooled
             }
@@ -670,7 +751,12 @@ impl Presence {
             self.project
         );
         let token = self.token()?;
-        let resp = self.http.delete(&url).bearer_auth(token).send().map_err(|e| e.to_string())?;
+        let resp = self
+            .http
+            .delete(&url)
+            .bearer_auth(token)
+            .send()
+            .map_err(|e| e.to_string())?;
         if resp.status().is_success() || resp.status().as_u16() == 404 {
             Ok(())
         } else {
@@ -754,7 +840,10 @@ fn parse_doc(d: &serde_json::Value) -> Option<(Vec<u8>, u64)> {
     let fields = d.get("fields")?;
     let b64 = fields["data"]["bytesValue"].as_str()?;
     let data = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-    let expires = fields["expiresAt"]["integerValue"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let expires = fields["expiresAt"]["integerValue"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     Some((data, expires))
 }
 
@@ -778,7 +867,10 @@ mod tests {
         // The TTL policy is on `expireAt` and only acts on a `timestampValue`, so every doc
         // must carry one (an integer-only doc would never be swept — the bug this guards).
         let json = doc_json(b"x", 1_000_000_000_000); // 2001-09-09T01:46:40Z
-        assert_eq!(json["fields"]["expireAt"]["timestampValue"], "2001-09-09T01:46:40Z");
+        assert_eq!(
+            json["fields"]["expireAt"]["timestampValue"],
+            "2001-09-09T01:46:40Z"
+        );
     }
 
     #[test]
@@ -795,7 +887,12 @@ mod tests {
 
     #[test]
     fn registry_doc_round_trips() {
-        let json = registry_doc_json("Node123", "eu-west1", "wss://eu-west1.relay.hopme.sh/", 9000);
+        let json = registry_doc_json(
+            "Node123",
+            "eu-west1",
+            "wss://eu-west1.relay.hopme.sh/",
+            9000,
+        );
         let doc = serde_json::json!({ "name": "x", "fields": json["fields"] });
         let p = parse_registry_doc(&doc).expect("parse");
         assert_eq!(p.node, "Node123");
@@ -828,6 +925,9 @@ mod tests {
     fn freshness_is_a_ttl_window() {
         assert!(is_fresh(1_000, 1_000, 90_000), "same instant is fresh");
         assert!(is_fresh(1_000, 90_000, 90_000), "within ttl is fresh");
-        assert!(!is_fresh(1_000, 200_000, 90_000), "past ttl is stale (offline)");
+        assert!(
+            !is_fresh(1_000, 200_000, 90_000),
+            "past ttl is stale (offline)"
+        );
     }
 }
