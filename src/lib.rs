@@ -149,6 +149,11 @@ pub struct FirestoreStore {
     /// Non-zero means Firestore is degraded and this store is NOT durable right now; `/healthz`
     /// surfaces it. `Arc` so a boxed store's owner can read it without owning the store.
     dropped: Arc<AtomicU64>,
+    /// stores-r2-05: the background writer's join handle. Drop signals `closed` then best-effort
+    /// joins (bounded wait) so ops enqueued-but-not-yet-flushed on an UNCLEAN teardown (panic, early
+    /// return, a drop not preceded by `flush()`) still get drained rather than silently lost. `Option`
+    /// so Drop can `take()` it and `join()`.
+    writer: Option<std::thread::JoinHandle<()>>,
 }
 
 /// The bounded, drop-oldest mirror queue's producer end (stores-09). Wraps a shared
@@ -205,6 +210,29 @@ impl FirestoreStore {
         self.dropped.clone()
     }
 
+    /// stores-r2-01: re-mirror an already-held bundle (after a spray-and-wait split or a retransmit
+    /// set_copies) reusing the RECEIVER-anchored `expires_at` this store recorded at `put` time,
+    /// NOT `created_at + lifetime_ms`. `created_at` is the SENDER's advisory clock (§8, defaults to
+    /// 0): re-deriving from it can rewrite the durable doc's `expireAt` into the past (created_at=0
+    /// -> ~1970), so the Firestore TTL policy would sweep a still-live spooled/handoff bundle early
+    /// and silently drop an offline recipient's §39-spooled message. The stored `seen_expiry` is the
+    /// same clamped `now + lifetime` `put()` mirrored, so every re-mirror carries the identical
+    /// bound. Falls back to skipping the mirror if the id is no longer tracked (nothing to persist).
+    fn remirror(&self, id: &BundleId) {
+        let Some(expires_at) = self.inner.seen_expiry(id) else {
+            return;
+        };
+        if let Some(b) = self.inner.get(id) {
+            if let Ok(data) = b.to_bytes() {
+                self.tx.send(Op::Write {
+                    id: *id,
+                    data,
+                    expires_at,
+                });
+            }
+        }
+    }
+
     /// Open over an arbitrary [`BundleMirror`] (stores-11 seam). `open()` is the production wiring
     /// (a live [`FirestoreClient`]); tests pass a fake mirror to exercise rehydrate/flush/mirror.
     pub fn open_with_mirror<M: BundleMirror>(mirror: M) -> Result<Self, String> {
@@ -222,6 +250,16 @@ impl FirestoreStore {
             if expires != 0 && expires <= now_ms {
                 continue; // past its §8 lifetime already; don't resurrect it
             }
+            // stores-r2-03: clamp the reinstated dedup window to now + MAX_SEEN_LIFETIME_MS. New docs
+            // are already bounded on the write side (put()), but a doc written by a PRE-FIX relay (or
+            // any doc with a hostile ~49-day `expiresAt`) that survives a scale cycle must not
+            // reinstate a 49-day seen window on cold start. `0` stays never-expire (stores-02); a
+            // legitimate far-future-within-a-week value is unchanged.
+            let expires = if expires == 0 {
+                0
+            } else {
+                expires.min(now_ms.saturating_add(hop_core::store::MAX_SEEN_LIFETIME_MS))
+            };
             if let Ok(bundle) = Bundle::from_bytes(&data) {
                 inner.put_with_expiry(bundle, expires);
             }
@@ -247,7 +285,7 @@ impl FirestoreStore {
             queue: queue.clone(),
             dropped: dropped.clone(),
         };
-        std::thread::spawn(move || {
+        let writer = std::thread::spawn(move || {
             let (lock, cvar) = &*queue;
             loop {
                 let op = {
@@ -288,24 +326,57 @@ impl FirestoreStore {
             }
         });
 
-        Ok(Self { inner, tx, dropped })
+        Ok(Self {
+            inner,
+            tx,
+            dropped,
+            writer: Some(writer),
+        })
     }
 }
+
+/// stores-r2-05: how long Drop waits for the writer to drain remaining ops before giving up. Bounded
+/// so an unclean teardown against a WEDGED/degraded Firestore can't hang the drop indefinitely, while
+/// a healthy backend (each op is fast) drains its small tail well within this. The clean path already
+/// calls `flush()` (SIGTERM); this is the safety net for panic/early-return drops that do not.
+const DROP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Drop for FirestoreStore {
     fn drop(&mut self) {
         // Signal the worker to exit once it has drained the backlog (mirrors an mpsc hangup, which
         // the old `Sender` did implicitly). Without this the worker parks on the Condvar forever.
-        let (lock, cvar) = &*self.tx.queue;
-        lock.lock().unwrap().closed = true;
-        cvar.notify_all();
+        {
+            let (lock, cvar) = &*self.tx.queue;
+            lock.lock().unwrap().closed = true;
+            cvar.notify_all();
+        }
+        // stores-r2-05: best-effort join so ops enqueued-but-not-flushed on an unclean teardown get a
+        // chance to drain instead of vanishing silently. Bounded (poll is_finished up to
+        // DROP_DRAIN_TIMEOUT) so a wedged backend can't make Drop block forever; if the writer is
+        // still going at the deadline we detach (the process is exiting anyway).
+        if let Some(handle) = self.writer.take() {
+            let deadline = Instant::now() + DROP_DRAIN_TIMEOUT;
+            while !handle.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
 impl Store for FirestoreStore {
     fn put(&mut self, bundle: Bundle, now_ms: u64) -> bool {
         let id = bundle.id();
-        let expires_at = now_ms.saturating_add(bundle.inner.lifetime_ms as u64);
+        // stores-r2-03: clamp the durable `expires_at` with the SAME bound the in-memory dedup uses
+        // (MAX_SEEN_LIFETIME_MS, F-07). Without it, a §39 private bundle with a hostile ~49-day
+        // `lifetime_ms` writes a 49-day `expiresAt` to Firestore; a cold-start rehydrate then reads
+        // that raw value straight into the seen map, reinstating a 49-day dedup window and defeating
+        // the clamp for exactly the bundles that survive a scale cycle. Bounding the write bounds
+        // both the Firestore TTL retention and everything rehydrate can reinstate.
+        let lifetime = (bundle.inner.lifetime_ms as u64).min(hop_core::store::MAX_SEEN_LIFETIME_MS);
+        let expires_at = now_ms.saturating_add(lifetime);
         let data = match bundle.to_bytes() {
             Ok(d) => d,
             Err(_) => return false,
@@ -355,38 +426,14 @@ impl Store for FirestoreStore {
     fn split_copies(&mut self, id: &BundleId) -> u16 {
         let give = self.inner.split_copies(id);
         if give > 0 {
-            if let Some(b) = self.inner.get(id) {
-                if let Ok(data) = b.to_bytes() {
-                    let expires_at = b
-                        .inner
-                        .created_at
-                        .saturating_add(b.inner.lifetime_ms as u64);
-                    self.tx.send(Op::Write {
-                        id: *id,
-                        data,
-                        expires_at,
-                    });
-                }
-            }
+            self.remirror(id);
         }
         give
     }
 
     fn set_copies(&mut self, id: &BundleId, copies: u16) {
         self.inner.set_copies(id, copies);
-        if let Some(b) = self.inner.get(id) {
-            if let Ok(data) = b.to_bytes() {
-                let expires_at = b
-                    .inner
-                    .created_at
-                    .saturating_add(b.inner.lifetime_ms as u64);
-                self.tx.send(Op::Write {
-                    id: *id,
-                    data,
-                    expires_at,
-                });
-            }
-        }
+        self.remirror(id);
     }
 
     // --- kv surface (stores-07): write-through to the durable `relays/{node}/kv` collection. ---
@@ -1401,6 +1448,193 @@ mod tests {
             expiry(&b_id) - expiry(&a_id),
             1_000,
             "each put's expiry is anchored at its own now_ms"
+        );
+    }
+
+    /// stores-r2-01: build a bundle with an explicit `created_at`/`lifetime_ms` so a test can force
+    /// the sender-clock skew that the re-anchor bug depended on.
+    fn sample_with(copies: u16, created_at: u64, lifetime_ms: u32) -> Bundle {
+        let from = Identity::generate();
+        let to = Identity::generate();
+        Bundle::create(
+            &from,
+            Destination::Device(to.address()),
+            &to.address(),
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"durable me".to_vec(),
+            },
+            BundleOpts {
+                copies,
+                created_at,
+                lifetime_ms,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn split_copies_remirror_uses_receiver_anchored_expiry_not_created_at() {
+        // stores-r2-01: a spray-and-wait split (or retransmit set_copies) on a RELAYED bundle whose
+        // sender stamped created_at=0 (advisory, defaults to 0) must NOT re-anchor the durable doc's
+        // expiry at created_at+lifetime (which lands ~1970 -> the Firestore TTL sweeps a still-live
+        // spooled/handoff bundle early, silently dropping an offline recipient's message). The
+        // re-mirror must reuse the receiver-anchored expiry recorded at put() time.
+        let mirror = FakeMirror::default();
+        let ops = mirror.ops.clone();
+        let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
+
+        let lifetime_ms: u32 = 3_600_000; // 1h
+        let now_ms: u64 = 10_000_000_000; // a real epoch-ms (well past 1970)
+        let b = sample_with(4, /*created_at=*/ 0, lifetime_ms);
+        let id = b.id();
+        assert!(store.put(b, now_ms));
+
+        // Force a spray-and-wait split, which re-mirrors the (now decremented) bundle.
+        let gave = store.split_copies(&id);
+        assert!(gave > 0, "split handed out at least one copy");
+        assert!(store.flush(std::time::Duration::from_secs(5)));
+
+        let recorded = ops.lock().unwrap().clone();
+        // Two puts recorded for this id: the initial put and the split re-mirror. BOTH must carry the
+        // receiver-anchored expiry (now + lifetime), never created_at(0) + lifetime.
+        let put_expiries: Vec<u64> = recorded
+            .iter()
+            .filter_map(|op| match op {
+                MirrorOp::Put { id: i, expires_at } if *i == id => Some(*expires_at),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(put_expiries.len(), 2, "initial put + split re-mirror");
+        let want = now_ms + lifetime_ms as u64;
+        for e in &put_expiries {
+            assert_eq!(
+                *e, want,
+                "re-mirror must reuse the receiver-anchored expiry (now+lifetime), \
+                 not created_at(0)+lifetime={}",
+                lifetime_ms
+            );
+            assert!(
+                *e > now_ms,
+                "expiry is in the FUTURE from the receiver clock, not ~1970"
+            );
+        }
+    }
+
+    #[test]
+    fn set_copies_remirror_uses_receiver_anchored_expiry() {
+        // stores-r2-01 twin: the retransmit set_copies path re-mirrors too, and must also carry the
+        // receiver-anchored expiry rather than the sender's advisory created_at.
+        let mirror = FakeMirror::default();
+        let ops = mirror.ops.clone();
+        let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
+
+        let lifetime_ms: u32 = 7_200_000; // 2h
+        let now_ms: u64 = 12_000_000_000;
+        let b = sample_with(4, /*created_at=*/ 0, lifetime_ms);
+        let id = b.id();
+        assert!(store.put(b, now_ms));
+        store.set_copies(&id, 2);
+        assert!(store.flush(std::time::Duration::from_secs(5)));
+
+        let want = now_ms + lifetime_ms as u64;
+        let recorded = ops.lock().unwrap().clone();
+        let last_put = recorded
+            .iter()
+            .rev()
+            .find_map(|op| match op {
+                MirrorOp::Put { id: i, expires_at } if *i == id => Some(*expires_at),
+                _ => None,
+            })
+            .expect("set_copies re-mirrored a put");
+        assert_eq!(
+            last_put, want,
+            "set_copies re-mirror uses the receiver-anchored expiry"
+        );
+    }
+
+    #[test]
+    fn put_clamps_durable_expiry_and_rehydrate_bounds_a_hostile_window() {
+        // stores-r2-03: a §39 bundle with a hostile ~49-day lifetime_ms must not write a 49-day
+        // durable expiresAt (clamp on the write side to MAX_SEEN_LIFETIME_MS), AND a doc that
+        // somehow carries a 49-day expiry (a pre-fix relay) must not reinstate a 49-day dedup window
+        // on cold-start rehydrate.
+        let now_ms: u64 = 20_000_000_000;
+        let hostile_lifetime: u32 = u32::MAX; // ~49 days
+        let clamp = hop_core::store::MAX_SEEN_LIFETIME_MS;
+
+        // (a) write-side clamp: put() must mirror an expiry no larger than now + clamp.
+        let mirror = FakeMirror::default();
+        let ops = mirror.ops.clone();
+        let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
+        let b = sample_with(1, /*created_at=*/ now_ms, hostile_lifetime);
+        let id = b.id();
+        assert!(store.put(b, now_ms));
+        assert!(store.flush(std::time::Duration::from_secs(5)));
+        let mirrored = ops
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|op| match op {
+                MirrorOp::Put { id: i, expires_at } if *i == id => Some(*expires_at),
+                _ => None,
+            })
+            .expect("put mirrored");
+        assert_eq!(
+            mirrored,
+            now_ms + clamp,
+            "durable expiry clamped to now + MAX_SEEN_LIFETIME_MS, not now + ~49 days"
+        );
+
+        // (b) rehydrate clamp: a durable doc carrying a raw ~49-day expiry must reinstate a dedup
+        // window bounded to now + clamp, so a prune just past the clamp drops it (the hostile window
+        // does NOT survive a scale cycle). Anchor against the REAL wall clock (open_with_mirror uses
+        // epoch_ms), so the stored expiry is genuinely ~49 days in the future, not already past.
+        let real_now = epoch_ms();
+        let hostile_expiry = real_now + hostile_lifetime as u64; // ~49 days out from real now
+        let held = sample_with(1, now_ms, hostile_lifetime);
+        let held_id = held.id();
+        let mirror2 = FakeMirror {
+            listing: vec![(held.to_bytes().unwrap(), hostile_expiry)],
+            ..Default::default()
+        };
+        // open_with_mirror anchors the clamp against the real wall clock (epoch_ms). The bundle is
+        // rehydrated live, but its dedup deadline is bounded to ~now + one week, well before the
+        // ~49-day hostile deadline.
+        let mut store2 = FirestoreStore::open_with_mirror(mirror2).unwrap();
+        assert!(store2.contains(&held_id), "live bundle still rehydrated");
+        // A prune just past the clamped window drops it; if the raw 49-day expiry had been
+        // reinstated, it would survive here.
+        store2.prune(epoch_ms() + clamp + 1);
+        assert!(
+            !store2.contains(&held_id),
+            "hostile 49-day dedup window was clamped to one week on rehydrate"
+        );
+    }
+
+    #[test]
+    fn drop_drains_pending_mirror_ops_without_explicit_flush() {
+        // stores-r2-05: a store dropped WITHOUT a preceding flush() (panic / early return) must still
+        // best-effort drain its enqueued ops to the durable mirror, not silently lose them.
+        let mirror = FakeMirror::default();
+        let ops = mirror.ops.clone();
+
+        let put_id = {
+            let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
+            let b = sample(2);
+            let id = b.id();
+            assert!(store.put(b, 1_000));
+            // Intentionally NO flush(): drop the store and rely on Drop's bounded join to drain.
+            id
+        }; // <- Drop runs here
+
+        let recorded = ops.lock().unwrap().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|op| matches!(op, MirrorOp::Put { id, .. } if *id == put_id)),
+            "Drop must drain the enqueued put to the durable mirror (no flush() called)"
         );
     }
 
