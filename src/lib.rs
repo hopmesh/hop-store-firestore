@@ -30,6 +30,15 @@ use base64::Engine;
 use hop_core::bundle::{Bundle, BundleId};
 use hop_core::store::{HaveSet, MemoryStore, Store};
 
+/// Wall-clock epoch-milliseconds. The relay stamps dedup/TTL deadlines in epoch-ms (the same clock
+/// relayd's tick uses), so rehydrate must anchor against the real clock, not a zero origin (stores-02).
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// A bundle write/delete to mirror to Firestore.
 enum Op {
     Write {
@@ -45,6 +54,32 @@ enum Op {
     Flush(mpsc::SyncSender<()>),
 }
 
+/// The durable mirror seam behind [`FirestoreStore`] (stores-11). The real relay uses
+/// [`FirestoreClient`] (a live REST endpoint); tests inject a fake so the Store impl's
+/// durability-critical paths (rehydrate expiry anchoring, flush drain, mirror ordering) are
+/// unit-testable without touching Firestore. All three methods run only on `open()` (list) and the
+/// background writer thread (put/delete), never the hot path.
+pub trait BundleMirror: Send + 'static {
+    /// Load durably-held bundles as `(sealed bytes, expires_at)` for rehydrate.
+    fn list_bundles(&self) -> Result<Vec<(Vec<u8>, u64)>, String>;
+    /// Mirror a write (upsert).
+    fn put_bundle(&self, id: &BundleId, data: &[u8], expires_at: u64) -> Result<(), String>;
+    /// Mirror a delete (idempotent).
+    fn delete_bundle(&self, id: &BundleId) -> Result<(), String>;
+}
+
+impl BundleMirror for FirestoreClient {
+    fn list_bundles(&self) -> Result<Vec<(Vec<u8>, u64)>, String> {
+        FirestoreClient::list_bundles(self)
+    }
+    fn put_bundle(&self, id: &BundleId, data: &[u8], expires_at: u64) -> Result<(), String> {
+        FirestoreClient::put_bundle(self, id, data, expires_at)
+    }
+    fn delete_bundle(&self, id: &BundleId) -> Result<(), String> {
+        FirestoreClient::delete_bundle(self, id)
+    }
+}
+
 /// Durable per-node store: in-memory hot path + Firestore mirror.
 pub struct FirestoreStore {
     inner: MemoryStore,
@@ -55,13 +90,28 @@ impl FirestoreStore {
     /// Open the store for `node_addr` in `project`, loading any held bundles back
     /// into memory. Spawns the background writer thread.
     pub fn open(project: &str, node_addr: &[u8]) -> Result<Self, String> {
-        let client = FirestoreClient::new(project, node_addr);
+        Self::open_with_mirror(FirestoreClient::new(project, node_addr))
+    }
+
+    /// Open over an arbitrary [`BundleMirror`] (stores-11 seam). `open()` is the production wiring
+    /// (a live [`FirestoreClient`]); tests pass a fake mirror to exercise rehydrate/flush/mirror.
+    pub fn open_with_mirror<M: BundleMirror>(mirror: M) -> Result<Self, String> {
         let mut inner = MemoryStore::new();
 
-        // Rehydrate held bundles from Firestore into memory (mark seen so dedup holds).
-        for (data, _expires) in client.list_bundles()? {
+        // Rehydrate held bundles from Firestore into memory (mark seen so dedup holds). The dedup
+        // expiry must be reinstated at each bundle's REAL absolute deadline (stores-02), not
+        // re-anchored at `now + lifetime`: a `put(_, 0)` would stamp expiry at epoch 0, and the
+        // relay's first real-clock prune (~1s after cold start) would wipe every rehydrated bundle
+        // and its seen row, killing cold-start mailbox delivery. Reading the stored `expires_at`
+        // back also means a re-list never re-extends the Firestore TTL of a gone-forever device's
+        // bundle. Already-expired rows are skipped (the TTL policy will sweep the durable copy).
+        let now_ms = epoch_ms();
+        for (data, expires) in mirror.list_bundles()? {
+            if expires != 0 && expires <= now_ms {
+                continue; // past its §8 lifetime already; don't resurrect it
+            }
             if let Ok(bundle) = Bundle::from_bytes(&data) {
-                inner.put(bundle, 0);
+                inner.put_with_expiry(bundle, expires);
             }
         }
 
@@ -80,8 +130,8 @@ impl FirestoreStore {
                             id,
                             data,
                             expires_at,
-                        } => client.put_bundle(id, data, *expires_at),
-                        Op::Delete { id } => client.delete_bundle(id),
+                        } => mirror.put_bundle(id, data, *expires_at),
+                        Op::Delete { id } => mirror.delete_bundle(id),
                         Op::Flush(_) => break,
                     };
                     if ok.is_ok() {
@@ -850,6 +900,189 @@ fn parse_doc(d: &serde_json::Value) -> Option<(Vec<u8>, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hop_core::prelude::*;
+    use std::sync::Arc;
+
+    /// stores-11: an in-memory [`BundleMirror`] fake. Records every mirrored op in order and serves
+    /// a scripted `list_bundles` for rehydrate, so the Store impl is testable without Firestore.
+    #[derive(Clone, Default)]
+    struct FakeMirror {
+        /// What `list_bundles` returns on open (rehydrate source).
+        listing: Vec<(Vec<u8>, u64)>,
+        /// Every put/delete the worker performs, in FIFO order.
+        ops: Arc<Mutex<Vec<MirrorOp>>>,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum MirrorOp {
+        Put { id: BundleId, expires_at: u64 },
+        Delete { id: BundleId },
+    }
+
+    impl BundleMirror for FakeMirror {
+        fn list_bundles(&self) -> std::result::Result<Vec<(Vec<u8>, u64)>, String> {
+            Ok(self.listing.clone())
+        }
+        fn put_bundle(
+            &self,
+            id: &BundleId,
+            _data: &[u8],
+            expires_at: u64,
+        ) -> std::result::Result<(), String> {
+            self.ops.lock().unwrap().push(MirrorOp::Put {
+                id: *id,
+                expires_at,
+            });
+            Ok(())
+        }
+        fn delete_bundle(&self, id: &BundleId) -> std::result::Result<(), String> {
+            self.ops.lock().unwrap().push(MirrorOp::Delete { id: *id });
+            Ok(())
+        }
+    }
+
+    fn sample(copies: u16) -> Bundle {
+        let from = Identity::generate();
+        let to = Identity::generate();
+        Bundle::create(
+            &from,
+            Destination::Device(to.address()),
+            &to.address(),
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"durable me".to_vec(),
+            },
+            BundleOpts {
+                copies,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rehydrate_preserves_the_stored_expiry_anchor() {
+        // stores-02/stores-11: rehydrate must reinstate each bundle's REAL absolute deadline, not
+        // re-anchor at now+lifetime. A far-future expiry survives; a stored 0 is treated as
+        // never-expire (put_with_expiry(_, 0)); an already-past expiry is skipped entirely.
+        let live = sample(4);
+        let live_id = live.id();
+        let expired = sample(4);
+        let expired_id = expired.id();
+        let far_future = epoch_ms() + 60 * 60 * 1000;
+
+        let mirror = FakeMirror {
+            listing: vec![
+                (live.to_bytes().unwrap(), far_future),
+                (expired.to_bytes().unwrap(), 1), // epoch-ms 1: long past
+            ],
+            ..Default::default()
+        };
+        let store = FirestoreStore::open_with_mirror(mirror).unwrap();
+
+        assert!(store.contains(&live_id), "live bundle rehydrated");
+        assert!(
+            store.seen(&live_id),
+            "dedup seen reinstated for live bundle"
+        );
+        assert!(
+            !store.contains(&expired_id),
+            "already-expired bundle must not be resurrected"
+        );
+
+        // The stored deadline (not now+lifetime) governs: a prune just before it keeps the bundle,
+        // a prune just after it drops it. If rehydrate had re-anchored, this would misbehave.
+        let mut store = store;
+        store.prune(far_future - 1);
+        assert!(store.contains(&live_id), "kept until its stored deadline");
+        store.prune(far_future + 1);
+        assert!(
+            !store.contains(&live_id),
+            "dropped past its stored deadline"
+        );
+    }
+
+    #[test]
+    fn flush_drains_mirror_ops_in_fifo_order() {
+        // F-21/stores-11: flush() must block until the FIFO writer has attempted every prior
+        // put/delete, and the mirror must see them in submission order.
+        let mirror = FakeMirror::default();
+        let ops = mirror.ops.clone();
+        let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
+
+        let a = sample(4);
+        let a_id = a.id();
+        let b = sample(4);
+        let b_id = b.id();
+        assert!(store.put(a, 1_000));
+        assert!(store.put(b, 2_000));
+        store.remove(&a_id);
+
+        assert!(
+            store.flush(std::time::Duration::from_secs(5)),
+            "flush must drain within the timeout"
+        );
+
+        let recorded = ops.lock().unwrap().clone();
+        // Assert FIFO order + ids: put(a), put(b), delete(a).
+        let shape: Vec<(&str, BundleId)> = recorded
+            .iter()
+            .map(|op| match op {
+                MirrorOp::Put { id, .. } => ("put", *id),
+                MirrorOp::Delete { id } => ("delete", *id),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![("put", a_id), ("put", b_id), ("delete", a_id)],
+            "mirror sees put(a), put(b), delete(a) in FIFO order"
+        );
+        // Each put's expiry is anchored at its own now_ms (1000+lt vs 2000+lt), so they differ by
+        // exactly the gap between the two put timestamps.
+        let expiry = |id: &BundleId| -> u64 {
+            recorded
+                .iter()
+                .find_map(|op| match op {
+                    MirrorOp::Put { id: i, expires_at } if i == id => Some(*expires_at),
+                    _ => None,
+                })
+                .expect("put recorded")
+        };
+        assert_eq!(
+            expiry(&b_id) - expiry(&a_id),
+            1_000,
+            "each put's expiry is anchored at its own now_ms"
+        );
+    }
+
+    #[test]
+    fn remove_mirrors_a_delete_only_when_present() {
+        // stores-11: remove() must mirror a Delete when the bundle was actually held, and NOT emit a
+        // spurious Delete for an id that was never there.
+        let mirror = FakeMirror::default();
+        let ops = mirror.ops.clone();
+        let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
+
+        let b = sample(4);
+        let id = b.id();
+        let absent = sample(4).id();
+
+        store.put(b, 0);
+        assert!(store.remove(&id).is_some());
+        assert!(store.remove(&absent).is_none(), "absent id removes nothing");
+
+        assert!(store.flush(std::time::Duration::from_secs(5)));
+        let recorded = ops.lock().unwrap().clone();
+        let deletes: Vec<_> = recorded
+            .iter()
+            .filter(|op| matches!(op, MirrorOp::Delete { .. }))
+            .collect();
+        assert_eq!(
+            deletes,
+            vec![&MirrorOp::Delete { id }],
+            "exactly one delete, for the held id only"
+        );
+    }
 
     #[test]
     fn doc_round_trips_through_firestore_encoding() {
