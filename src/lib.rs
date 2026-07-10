@@ -9,9 +9,24 @@
 //! a Firestore round-trip: a [`MemoryStore`] is the hot path and a **background
 //! writer thread** mirrors writes/deletes to Firestore (a FIFO channel preserves
 //! per-id order). On startup we **load** the held bundles back from Firestore into
-//! memory; the node's `rehydrate` then resumes them. Only *bundles* are persisted —
-//! the dedup `seen` set is in-memory (losing it across a scale cycle costs at most
-//! some re-flooding, which the receiver dedups; §7).
+//! memory; the node's `rehydrate` then resumes them.
+//!
+//! Two durable surfaces are mirrored, both loaded on open and write-through on mutation:
+//!
+//!  * **bundles** (`relays/{node}/bundles`): the store-and-forward mailbox.
+//!  * **kv** (`relays/{node}/kv`, stores-07): the small key -> bytes side store the Store trait
+//!    exposes (DESIGN.md §25) for state that must survive a scale cycle but isn't a bundle:
+//!    forward-secret ratchet sessions, prekey secrets, pending content. Before stores-07 this was
+//!    memory-only on the relay, so a scale-to-zero dropped every relay-hosted session and forced a
+//!    re-secure churn against mobile peers; now it round-trips through the same mirror seam.
+//!
+//! The dedup `seen` set stays in-memory (losing it across a scale cycle costs at most some
+//! re-flooding, which the receiver dedups; §7).
+//!
+//! stores-09: the mirror channel is **bounded** (drop-oldest under sustained backpressure), so a
+//! degraded Firestore backing the queue up cannot grow relay memory without bound. Dropped ops are
+//! counted ([`FirestoreStore::mirror_dropped`]) so `/healthz` can surface a store that is silently
+//! shedding durable writes rather than pretending everything persisted.
 //!
 //! Durable cleanup of expired bundles is left to a **Firestore TTL policy** on the
 //! `expireAt` timestamp field (a one-time setup; TTL only sweeps `timestampValue`
@@ -22,13 +37,20 @@
 //! Auth: a Bearer token from the GCE/Cloud Run **metadata server** (workload
 //! identity), or the `FIRESTORE_ACCESS_TOKEN` env var for local runs.
 
-use std::sync::mpsc::{self, Sender};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use hop_core::bundle::{Bundle, BundleId};
 use hop_core::store::{HaveSet, MemoryStore, Store};
+
+/// stores-09: bound on the in-memory mirror backlog. A degraded Firestore backs writes up (each op
+/// has a 15s reqwest timeout + 3 retries), so without a cap the queue grows with relay memory. Past
+/// this we drop the OLDEST pending op (and count it) rather than block the single-owner driver or
+/// grow unbounded. Generous for a transient blip; a sustained outage sheds oldest-first.
+const MIRROR_QUEUE_CAP: usize = 4_096;
 
 /// Wall-clock epoch-milliseconds. The relay stamps dedup/TTL deadlines in epoch-ms (the same clock
 /// relayd's tick uses), so rehydrate must anchor against the real clock, not a zero origin (stores-02).
@@ -39,7 +61,7 @@ fn epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// A bundle write/delete to mirror to Firestore.
+/// A write/delete to mirror to Firestore (bundle or kv).
 enum Op {
     Write {
         id: BundleId,
@@ -48,6 +70,16 @@ enum Op {
     },
     Delete {
         id: BundleId,
+    },
+    /// stores-07: a kv upsert (`relays/{node}/kv/{key}`). `key` is a caller-chosen string
+    /// (e.g. `session/<peer>`); `value` is opaque bytes.
+    KvWrite {
+        key: String,
+        value: Vec<u8>,
+    },
+    /// stores-07: a kv delete (idempotent).
+    KvDelete {
+        key: String,
     },
     /// F-21: drain sentinel. The worker acks this AFTER processing every op ahead of it (mpsc is
     /// FIFO), so `flush()` blocking on the ack means all pending mirrors have been attempted.
@@ -66,6 +98,23 @@ pub trait BundleMirror: Send + 'static {
     fn put_bundle(&self, id: &BundleId, data: &[u8], expires_at: u64) -> Result<(), String>;
     /// Mirror a delete (idempotent).
     fn delete_bundle(&self, id: &BundleId) -> Result<(), String>;
+
+    // --- kv surface (stores-07) -----------------------------------------------------------
+    // A durable key -> bytes side store mirrored the same way bundles are: loaded on open,
+    // write-through on mutation. Defaults keep bundle-only fakes/backends compiling unchanged.
+
+    /// Load all persisted kv pairs as `(key, value)` for rehydrate. Default: none.
+    fn list_kv(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        Ok(Vec::new())
+    }
+    /// Mirror a kv upsert. Default: no-op success (bundle-only backend).
+    fn put_kv(&self, _key: &str, _value: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+    /// Mirror a kv delete (idempotent). Default: no-op success.
+    fn delete_kv(&self, _key: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 impl BundleMirror for FirestoreClient {
@@ -78,19 +127,82 @@ impl BundleMirror for FirestoreClient {
     fn delete_bundle(&self, id: &BundleId) -> Result<(), String> {
         FirestoreClient::delete_bundle(self, id)
     }
+    fn list_kv(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        FirestoreClient::list_kv(self)
+    }
+    fn put_kv(&self, key: &str, value: &[u8]) -> Result<(), String> {
+        FirestoreClient::put_kv(self, key, value)
+    }
+    fn delete_kv(&self, key: &str) -> Result<(), String> {
+        FirestoreClient::delete_kv(self, key)
+    }
 }
 
 /// Durable per-node store: in-memory hot path + Firestore mirror.
 pub struct FirestoreStore {
     inner: MemoryStore,
-    tx: Sender<Op>,
+    /// The bounded mirror queue (stores-09). Enqueue is drop-oldest under backpressure; the worker
+    /// thread is the sole consumer. A [`SyncSender`] alone can't drop-oldest, so the queue is an
+    /// explicit `VecDeque` behind a `Mutex` + `Condvar` and `tx` carries the drop policy.
+    tx: MirrorTx,
+    /// stores-09: count of durable ops shed because the mirror backlog was at [`MIRROR_QUEUE_CAP`].
+    /// Non-zero means Firestore is degraded and this store is NOT durable right now; `/healthz`
+    /// surfaces it. `Arc` so a boxed store's owner can read it without owning the store.
+    dropped: Arc<AtomicU64>,
+}
+
+/// The bounded, drop-oldest mirror queue's producer end (stores-09). Wraps a shared
+/// `Mutex<VecDeque<Op>>` + `Condvar`; enqueue pops the oldest op when the backlog is at the cap
+/// (bumping `dropped`) so a degraded backend sheds oldest-first instead of growing relay memory or
+/// blocking the single-owner driver.
+#[derive(Clone)]
+struct MirrorTx {
+    queue: Arc<(Mutex<MirrorQueue>, std::sync::Condvar)>,
+    dropped: Arc<AtomicU64>,
+}
+
+struct MirrorQueue {
+    ops: std::collections::VecDeque<Op>,
+    /// Set on drop of the store so the worker exits once drained (mirrors an mpsc hangup).
+    closed: bool,
+}
+
+impl MirrorTx {
+    /// Enqueue an op, dropping the OLDEST pending op if the backlog is already at the cap. A `Flush`
+    /// sentinel is never dropped (it carries the caller's ack channel and must reach the worker).
+    fn send(&self, op: Op) {
+        let (lock, cvar) = &*self.queue;
+        let mut q = lock.lock().unwrap();
+        if q.ops.len() >= MIRROR_QUEUE_CAP {
+            // Drop the oldest NON-flush op to make room; never discard a flush ack.
+            if let Some(pos) = q.ops.iter().position(|o| !matches!(o, Op::Flush(_))) {
+                q.ops.remove(pos);
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        q.ops.push_back(op);
+        cvar.notify_one();
+    }
 }
 
 impl FirestoreStore {
-    /// Open the store for `node_addr` in `project`, loading any held bundles back
+    /// Open the store for `node_addr` in `project`, loading any held bundles + kv back
     /// into memory. Spawns the background writer thread.
     pub fn open(project: &str, node_addr: &[u8]) -> Result<Self, String> {
         Self::open_with_mirror(FirestoreClient::new(project, node_addr))
+    }
+
+    /// stores-09: how many durable ops have been shed because the mirror backlog hit its cap. `0`
+    /// means the mirror is keeping up (the store is durable); non-zero means Firestore is degraded
+    /// and writes are being lost, which `/healthz` should surface rather than report all-green.
+    pub fn mirror_dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// stores-09: a shared handle to the dropped-op counter, so a supervisor (e.g. relayd's
+    /// `/healthz`) can read it from another thread without owning the (driver-owned) store.
+    pub fn mirror_dropped_handle(&self) -> Arc<AtomicU64> {
+        self.dropped.clone()
     }
 
     /// Open over an arbitrary [`BundleMirror`] (stores-11 seam). `open()` is the production wiring
@@ -115,9 +227,41 @@ impl FirestoreStore {
             }
         }
 
-        let (tx, rx) = mpsc::channel::<Op>();
+        // stores-07: rehydrate the durable kv side store (sessions/prekeys/pending) so a relay that
+        // scaled to zero comes back with its forward-secret sessions intact instead of re-securing
+        // against every mobile peer. kv has no per-row expiry (unlike bundles); it lives until the
+        // owner removes it.
+        for (key, value) in mirror.list_kv()? {
+            inner.put_kv(&key, value);
+        }
+
+        let dropped = Arc::new(AtomicU64::new(0));
+        let queue = Arc::new((
+            Mutex::new(MirrorQueue {
+                ops: std::collections::VecDeque::new(),
+                closed: false,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let tx = MirrorTx {
+            queue: queue.clone(),
+            dropped: dropped.clone(),
+        };
         std::thread::spawn(move || {
-            for op in rx {
+            let (lock, cvar) = &*queue;
+            loop {
+                let op = {
+                    let mut q = lock.lock().unwrap();
+                    loop {
+                        if let Some(op) = q.ops.pop_front() {
+                            break op;
+                        }
+                        if q.closed {
+                            return; // producer gone and backlog drained
+                        }
+                        q = cvar.wait(q).unwrap();
+                    }
+                };
                 // F-21: a flush sentinel just acks — everything before it in the FIFO is done.
                 if let Op::Flush(ack) = &op {
                     let _ = ack.send(());
@@ -132,6 +276,8 @@ impl FirestoreStore {
                             expires_at,
                         } => mirror.put_bundle(id, data, *expires_at),
                         Op::Delete { id } => mirror.delete_bundle(id),
+                        Op::KvWrite { key, value } => mirror.put_kv(key, value),
+                        Op::KvDelete { key } => mirror.delete_kv(key),
                         Op::Flush(_) => break,
                     };
                     if ok.is_ok() {
@@ -142,7 +288,17 @@ impl FirestoreStore {
             }
         });
 
-        Ok(Self { inner, tx })
+        Ok(Self { inner, tx, dropped })
+    }
+}
+
+impl Drop for FirestoreStore {
+    fn drop(&mut self) {
+        // Signal the worker to exit once it has drained the backlog (mirrors an mpsc hangup, which
+        // the old `Sender` did implicitly). Without this the worker parks on the Condvar forever.
+        let (lock, cvar) = &*self.tx.queue;
+        lock.lock().unwrap().closed = true;
+        cvar.notify_all();
     }
 }
 
@@ -155,7 +311,7 @@ impl Store for FirestoreStore {
             Err(_) => return false,
         };
         if self.inner.put(bundle, now_ms) {
-            let _ = self.tx.send(Op::Write {
+            self.tx.send(Op::Write {
                 id,
                 data,
                 expires_at,
@@ -173,7 +329,7 @@ impl Store for FirestoreStore {
     fn remove(&mut self, id: &BundleId) -> Option<Bundle> {
         let removed = self.inner.remove(id);
         if removed.is_some() {
-            let _ = self.tx.send(Op::Delete { id: *id });
+            self.tx.send(Op::Delete { id: *id });
         }
         removed
     }
@@ -205,7 +361,7 @@ impl Store for FirestoreStore {
                         .inner
                         .created_at
                         .saturating_add(b.inner.lifetime_ms as u64);
-                    let _ = self.tx.send(Op::Write {
+                    self.tx.send(Op::Write {
                         id: *id,
                         data,
                         expires_at,
@@ -224,7 +380,7 @@ impl Store for FirestoreStore {
                     .inner
                     .created_at
                     .saturating_add(b.inner.lifetime_ms as u64);
-                let _ = self.tx.send(Op::Write {
+                self.tx.send(Op::Write {
                     id: *id,
                     data,
                     expires_at,
@@ -233,13 +389,38 @@ impl Store for FirestoreStore {
         }
     }
 
+    // --- kv surface (stores-07): write-through to the durable `relays/{node}/kv` collection. ---
+
+    fn put_kv(&mut self, key: &str, value: Vec<u8>) {
+        self.inner.put_kv(key, value.clone());
+        self.tx.send(Op::KvWrite {
+            key: key.to_string(),
+            value,
+        });
+    }
+
+    fn get_kv(&self, key: &str) -> Option<Vec<u8>> {
+        // The in-memory copy is authoritative in-process (loaded on open, kept in sync on write).
+        self.inner.get_kv(key)
+    }
+
+    fn remove_kv(&mut self, key: &str) {
+        self.inner.remove_kv(key);
+        self.tx.send(Op::KvDelete {
+            key: key.to_string(),
+        });
+    }
+
+    fn list_kv(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+        self.inner.list_kv(prefix)
+    }
+
     /// F-21: block until the background writer has drained every pending mirror (or `timeout`
-    /// elapses). The mpsc is FIFO, so an acked Flush means every prior Write/Delete was attempted.
+    /// elapses). The queue is FIFO, so an acked Flush means every prior Write/Delete/kv op was
+    /// attempted. The Flush sentinel is never drop-oldest'd (stores-09), so this can't wedge.
     fn flush(&self, timeout: std::time::Duration) -> bool {
         let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(0);
-        if self.tx.send(Op::Flush(ack_tx)).is_err() {
-            return false; // worker already gone
-        }
+        self.tx.send(Op::Flush(ack_tx));
         ack_rx.recv_timeout(timeout).is_ok()
     }
 }
@@ -251,6 +432,7 @@ impl Store for FirestoreStore {
 struct FirestoreClient {
     http: reqwest::blocking::Client,
     collection_url: String, // .../documents/relays/{node}/bundles
+    kv_url: String,         // .../documents/relays/{node}/kv (stores-07)
     token: Mutex<Option<(String, Instant)>>,
 }
 
@@ -261,12 +443,15 @@ impl FirestoreClient {
         let collection_url = format!(
             "{base}/projects/{project}/databases/(default)/documents/relays/{node}/bundles"
         );
+        let kv_url =
+            format!("{base}/projects/{project}/databases/(default)/documents/relays/{node}/kv");
         Self {
             http: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()
                 .expect("http client"),
             collection_url,
+            kv_url,
             token: Mutex::new(None),
         }
     }
@@ -349,6 +534,105 @@ impl FirestoreClient {
         }
         Ok(out)
     }
+
+    // --- kv surface (stores-07) -----------------------------------------------------------
+    // A caller's kv key (e.g. `session/<peer>`) can contain `/` and other characters Firestore
+    // forbids in a document id, so the doc id is `bs58(key-bytes)` and the ORIGINAL key is carried
+    // as a field so `list_kv` recovers it exactly. Values are opaque bytes (base64 bytesValue).
+
+    fn put_kv(&self, key: &str, value: &[u8]) -> Result<(), String> {
+        let doc = bs58::encode(key.as_bytes()).into_string();
+        let url = format!("{}/{doc}", self.kv_url);
+        let body = kv_doc_json(key, value);
+        let token = self.token()?;
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .map_err(|e| e.to_string())?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("put_kv {}", resp.status()))
+        }
+    }
+
+    fn delete_kv(&self, key: &str) -> Result<(), String> {
+        let doc = bs58::encode(key.as_bytes()).into_string();
+        let url = format!("{}/{doc}", self.kv_url);
+        let token = self.token()?;
+        let resp = self
+            .http
+            .delete(&url)
+            .bearer_auth(token)
+            .send()
+            .map_err(|e| e.to_string())?;
+        if resp.status().is_success() || resp.status().as_u16() == 404 {
+            Ok(())
+        } else {
+            Err(format!("delete_kv {}", resp.status()))
+        }
+    }
+
+    fn list_kv(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let token = self.token()?;
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut url = format!("{}?pageSize=300", self.kv_url);
+            if let Some(t) = &page_token {
+                url.push_str(&format!("&pageToken={t}"));
+            }
+            let resp = self
+                .http
+                .get(&url)
+                .bearer_auth(&token)
+                .send()
+                .map_err(|e| e.to_string())?;
+            if resp.status().as_u16() == 404 {
+                return Ok(out); // collection doesn't exist yet
+            }
+            if !resp.status().is_success() {
+                return Err(format!("list_kv {}", resp.status()));
+            }
+            let v: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+            if let Some(docs) = v["documents"].as_array() {
+                for d in docs {
+                    if let Some(pair) = parse_kv_doc(d) {
+                        out.push(pair);
+                    }
+                }
+            }
+            match v["nextPageToken"].as_str() {
+                Some(t) if !t.is_empty() => page_token = Some(t.to_string()),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Build a Firestore document body for a kv pair: the original key (so `list_kv` recovers it
+/// exactly, since the doc id is a base58 of the key bytes) plus the opaque value as base64 bytes.
+fn kv_doc_json(key: &str, value: &[u8]) -> serde_json::Value {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(value);
+    serde_json::json!({
+        "fields": {
+            "key": { "stringValue": key },
+            "value": { "bytesValue": b64 },
+        }
+    })
+}
+
+/// Parse a Firestore kv document into `(key, value)`.
+fn parse_kv_doc(d: &serde_json::Value) -> Option<(String, Vec<u8>)> {
+    let fields = d.get("fields")?;
+    let key = fields["key"]["stringValue"].as_str()?.to_string();
+    let b64 = fields["value"]["bytesValue"].as_str()?;
+    let value = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    Some((key, value))
 }
 
 // ---------------------------------------------------------------------------
@@ -904,19 +1188,25 @@ mod tests {
     use std::sync::Arc;
 
     /// stores-11: an in-memory [`BundleMirror`] fake. Records every mirrored op in order and serves
-    /// a scripted `list_bundles` for rehydrate, so the Store impl is testable without Firestore.
+    /// a scripted `list_bundles`/`list_kv` for rehydrate, so the Store impl is testable without
+    /// Firestore. It also keeps a durable `kv` map (stores-07) so a "restart" (drop + reopen over
+    /// the same shared state) recovers what was written.
     #[derive(Clone, Default)]
     struct FakeMirror {
         /// What `list_bundles` returns on open (rehydrate source).
         listing: Vec<(Vec<u8>, u64)>,
         /// Every put/delete the worker performs, in FIFO order.
         ops: Arc<Mutex<Vec<MirrorOp>>>,
+        /// stores-07: the durable kv state, shared across a simulated restart.
+        kv: Arc<Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
     }
 
     #[derive(Clone, Debug, PartialEq)]
     enum MirrorOp {
         Put { id: BundleId, expires_at: u64 },
         Delete { id: BundleId },
+        KvPut { key: String },
+        KvDelete { key: String },
     }
 
     impl BundleMirror for FakeMirror {
@@ -938,6 +1228,64 @@ mod tests {
         fn delete_bundle(&self, id: &BundleId) -> std::result::Result<(), String> {
             self.ops.lock().unwrap().push(MirrorOp::Delete { id: *id });
             Ok(())
+        }
+        fn list_kv(&self) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
+            Ok(self
+                .kv
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect())
+        }
+        fn put_kv(&self, key: &str, value: &[u8]) -> std::result::Result<(), String> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(MirrorOp::KvPut { key: key.into() });
+            self.kv
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_vec());
+            Ok(())
+        }
+        fn delete_kv(&self, key: &str) -> std::result::Result<(), String> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(MirrorOp::KvDelete { key: key.into() });
+            self.kv.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    /// A mirror whose writes always fail (a degraded/offline Firestore), used for stores-09
+    /// backpressure. Every put/delete errors, so the worker exhausts its retries and the op stays a
+    /// long time in flight -- letting the bounded queue back up so drop-oldest kicks in.
+    #[derive(Clone, Default)]
+    struct FailingMirror {
+        /// Bumped every time the worker actually attempts a bundle write (to prove it kept trying).
+        attempts: Arc<AtomicU64>,
+    }
+    impl BundleMirror for FailingMirror {
+        fn list_bundles(&self) -> std::result::Result<Vec<(Vec<u8>, u64)>, String> {
+            Ok(Vec::new())
+        }
+        fn put_bundle(
+            &self,
+            _id: &BundleId,
+            _data: &[u8],
+            _e: u64,
+        ) -> std::result::Result<(), String> {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            // Block a beat so the queue fills faster than the worker drains it (simulates a slow,
+            // failing backend), then fail so the op is retried.
+            std::thread::sleep(Duration::from_millis(5));
+            Err("backend down".into())
+        }
+        fn delete_bundle(&self, _id: &BundleId) -> std::result::Result<(), String> {
+            std::thread::sleep(Duration::from_millis(5));
+            Err("backend down".into())
         }
     }
 
@@ -1024,12 +1372,13 @@ mod tests {
         );
 
         let recorded = ops.lock().unwrap().clone();
-        // Assert FIFO order + ids: put(a), put(b), delete(a).
+        // Assert FIFO order + ids: put(a), put(b), delete(a). (Only bundle ops here.)
         let shape: Vec<(&str, BundleId)> = recorded
             .iter()
-            .map(|op| match op {
-                MirrorOp::Put { id, .. } => ("put", *id),
-                MirrorOp::Delete { id } => ("delete", *id),
+            .filter_map(|op| match op {
+                MirrorOp::Put { id, .. } => Some(("put", *id)),
+                MirrorOp::Delete { id } => Some(("delete", *id)),
+                MirrorOp::KvPut { .. } | MirrorOp::KvDelete { .. } => None,
             })
             .collect();
         assert_eq!(
@@ -1081,6 +1430,117 @@ mod tests {
             deletes,
             vec![&MirrorOp::Delete { id }],
             "exactly one delete, for the held id only"
+        );
+    }
+
+    #[test]
+    fn kv_round_trips_and_survives_a_simulated_restart() {
+        // stores-07: kv writes must mirror through the same seam as bundles, be readable in-process,
+        // and survive a scale cycle (drop the store, reopen over the SAME durable mirror state).
+        let mirror = FakeMirror::default();
+
+        {
+            let mut store = FirestoreStore::open_with_mirror(mirror.clone()).unwrap();
+            store.put_kv("session/peerX", b"ratchet-state".to_vec());
+            store.put_kv("prekey/secret", b"xk".to_vec());
+            store.put_kv("doomed", b"bye".to_vec());
+            store.remove_kv("doomed");
+            // In-process reads are authoritative immediately (no Firestore round-trip needed).
+            assert_eq!(
+                store.get_kv("session/peerX"),
+                Some(b"ratchet-state".to_vec())
+            );
+            assert_eq!(store.get_kv("doomed"), None);
+            let mut sessions = store.list_kv("session/");
+            sessions.sort();
+            assert_eq!(
+                sessions,
+                vec![("session/peerX".to_string(), b"ratchet-state".to_vec())]
+            );
+            // Drain the mirror so every kv op has been applied to the durable fake before we drop.
+            assert!(
+                store.flush(Duration::from_secs(5)),
+                "mirror drained before restart"
+            );
+        } // store dropped == relay scaled to zero
+
+        // "Restart": a fresh store over the SAME durable mirror state must rehydrate kv (stores-07's
+        // whole point: relay-hosted forward-secret sessions survive scale-to-zero, no re-secure churn).
+        let restarted = FirestoreStore::open_with_mirror(mirror.clone()).unwrap();
+        assert_eq!(
+            restarted.get_kv("session/peerX"),
+            Some(b"ratchet-state".to_vec()),
+            "session survived the scale cycle"
+        );
+        assert_eq!(restarted.get_kv("prekey/secret"), Some(b"xk".to_vec()));
+        assert_eq!(
+            restarted.get_kv("doomed"),
+            None,
+            "a removed key must not resurrect on restart"
+        );
+    }
+
+    #[test]
+    fn kv_doc_round_trips_through_firestore_encoding() {
+        // stores-07: a kv key that contains '/' (illegal in a Firestore doc id) and a value with
+        // arbitrary bytes must round-trip: the original key is carried as a field and recovered.
+        let json = kv_doc_json("session/peer\u{1f600}", b"\x00\x01\xff bytes");
+        let doc = serde_json::json!({ "name": "x", "fields": json["fields"] });
+        let (key, value) = parse_kv_doc(&doc).expect("parse");
+        assert_eq!(key, "session/peer\u{1f600}");
+        assert_eq!(value, b"\x00\x01\xff bytes");
+    }
+
+    #[test]
+    fn mirror_queue_is_bounded_and_drops_oldest_under_a_failing_backend() {
+        // stores-09: with a slow/failing Firestore the backlog must NOT grow without bound. We flood
+        // far past the cap against a mirror whose writes fail (so ops linger in flight), and assert
+        // (1) the queue never exceeds the cap, and (2) the shed ops are COUNTED (mirror_dropped),
+        // rather than silently lost while put() keeps returning true.
+        let mirror = FailingMirror::default();
+        let attempts = mirror.attempts.clone();
+        let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
+
+        let flood = MIRROR_QUEUE_CAP + 5_000;
+        for i in 0..flood {
+            // Distinct ids so each is a real enqueue (put dedups on id).
+            let b = sample(4);
+            store.put(b, i as u64);
+            // The queue length is an internal detail; assert the invariant via the public counter +
+            // the fact that we never OOM. Peek the backlog directly to prove the bound holds.
+            let qlen = store.tx.queue.0.lock().unwrap().ops.len();
+            assert!(
+                qlen <= MIRROR_QUEUE_CAP,
+                "backlog {qlen} must never exceed the cap {MIRROR_QUEUE_CAP}"
+            );
+        }
+
+        // We enqueued far more than the cap against a backend that can't keep up, so a large number
+        // of ops must have been shed - and counted, not silently dropped.
+        assert!(
+            store.mirror_dropped() > 0,
+            "sustained backpressure must shed (and count) oldest ops"
+        );
+        // Sanity: the worker really was attempting writes against the failing backend.
+        assert!(
+            attempts.load(Ordering::Relaxed) > 0,
+            "the worker kept attempting writes against the degraded backend"
+        );
+    }
+
+    #[test]
+    fn a_flush_sentinel_is_never_dropped_even_at_the_cap() {
+        // stores-09: drop-oldest must never discard a Flush ack (it carries the caller's channel), or
+        // flush() could block forever. Fill PAST the cap (so drop-oldest is actively running) with a
+        // fast mirror, then flush must still resolve - the sentinel rides through and is acked once
+        // the backlog ahead of it clears. The invariant proven: shedding never touches a Flush.
+        let mut store = FirestoreStore::open_with_mirror(FakeMirror::default()).unwrap();
+        for i in 0..(MIRROR_QUEUE_CAP + 5_000) {
+            store.put(sample(4), i as u64);
+        }
+        assert!(
+            store.flush(Duration::from_secs(30)),
+            "flush must complete; the sentinel is never drop-oldest'd"
         );
     }
 
