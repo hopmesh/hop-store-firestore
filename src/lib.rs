@@ -247,19 +247,22 @@ impl FirestoreStore {
         // bundle. Already-expired rows are skipped (the TTL policy will sweep the durable copy).
         let now_ms = epoch_ms();
         for (data, expires) in mirror.list_bundles()? {
-            if expires != 0 && expires <= now_ms {
-                continue; // past its §8 lifetime already; don't resurrect it
+            // stores-r3-02: `expires <= now_ms` is "past its §8 lifetime; don't resurrect it". This
+            // now includes `expires == 0`. The old code special-cased 0 as a "never-expire" sentinel
+            // and stored `put_with_expiry(_, 0)`, but MemoryStore::prune drops any id with
+            // `exp <= now_ms` — and `0 <= now_ms` is ALWAYS true — so a 0-expiry bundle was wiped on
+            // the very first real-clock prune (~1s after cold start). The sentinel was therefore
+            // false and dead (every live writer stamps a real now+lifetime, never 0). We treat 0 like
+            // any past deadline and skip it, so the contract matches prune's actual semantics.
+            if expires <= now_ms {
+                continue;
             }
             // stores-r2-03: clamp the reinstated dedup window to now + MAX_SEEN_LIFETIME_MS. New docs
             // are already bounded on the write side (put()), but a doc written by a PRE-FIX relay (or
             // any doc with a hostile ~49-day `expiresAt`) that survives a scale cycle must not
-            // reinstate a 49-day seen window on cold start. `0` stays never-expire (stores-02); a
-            // legitimate far-future-within-a-week value is unchanged.
-            let expires = if expires == 0 {
-                0
-            } else {
-                expires.min(now_ms.saturating_add(hop_core::store::MAX_SEEN_LIFETIME_MS))
-            };
+            // reinstate a 49-day seen window on cold start. A legitimate far-future-within-a-week
+            // value is unchanged.
+            let expires = expires.min(now_ms.saturating_add(hop_core::store::MAX_SEEN_LIFETIME_MS));
             if let Ok(bundle) = Bundle::from_bytes(&data) {
                 inner.put_with_expiry(bundle, expires);
             }
@@ -434,6 +437,13 @@ impl Store for FirestoreStore {
     fn set_copies(&mut self, id: &BundleId, copies: u16) {
         self.inner.set_copies(id, copies);
         self.remirror(id);
+    }
+
+    fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
+        // stores-r3-01: expose the hot-path MemoryStore's receiver-anchored dedup deadline so the
+        // relay's handoff/spool path anchors the durable Firestore `expireAt` to it (not to the
+        // sender's advisory created_at, which can be 0 and would sweep a live message early).
+        self.inner.seen_expiry(id)
     }
 
     // --- kv surface (stores-07): write-through to the durable `relays/{node}/kv` collection. ---
@@ -1358,8 +1368,8 @@ mod tests {
     #[test]
     fn rehydrate_preserves_the_stored_expiry_anchor() {
         // stores-02/stores-11: rehydrate must reinstate each bundle's REAL absolute deadline, not
-        // re-anchor at now+lifetime. A far-future expiry survives; a stored 0 is treated as
-        // never-expire (put_with_expiry(_, 0)); an already-past expiry is skipped entirely.
+        // re-anchor at now+lifetime. A far-future expiry survives; an already-past expiry (incl. 0,
+        // see stores-r3-02) is skipped entirely.
         let live = sample(4);
         let live_id = live.id();
         let expired = sample(4);
@@ -1394,6 +1404,51 @@ mod tests {
         assert!(
             !store.contains(&live_id),
             "dropped past its stored deadline"
+        );
+    }
+
+    #[test]
+    fn rehydrate_does_not_resurrect_a_zero_expiry_bundle() {
+        // stores-r3-02: the old code special-cased a stored `expires == 0` as a "never-expire"
+        // sentinel and did put_with_expiry(_, 0). But MemoryStore::prune drops any id with
+        // `exp <= now_ms`, and `0 <= now_ms` is ALWAYS true, so that bundle was wiped on the FIRST
+        // real-clock prune (~1s after cold start): the sentinel was false. The contract is now
+        // honest — a 0 (or any past) expiry is treated as already-expired and NOT resurrected, so
+        // there is no phantom bundle that appears rehydrated only to vanish on the next prune.
+        let zero = sample(4);
+        let zero_id = zero.id();
+        let live = sample(4);
+        let live_id = live.id();
+        let far_future = epoch_ms() + 60 * 60 * 1000;
+
+        let mirror = FakeMirror {
+            listing: vec![
+                (zero.to_bytes().unwrap(), 0), // the (former) "never-expire" sentinel
+                (live.to_bytes().unwrap(), far_future), // a normal live bundle for contrast
+            ],
+            ..Default::default()
+        };
+        let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
+
+        assert!(
+            !store.contains(&zero_id),
+            "a 0-expiry doc is treated as past and is NOT resurrected (no phantom bundle)"
+        );
+        assert!(
+            !store.seen(&zero_id),
+            "and it does not poison the dedup set with a doomed 0-expiry seen row"
+        );
+        assert!(
+            store.contains(&live_id),
+            "the live bundle is still rehydrated"
+        );
+
+        // A prune at real 'now' must not surprise anyone: nothing 0-related lingers to be reaped,
+        // and the live bundle survives (it was never the 0 case).
+        store.prune(epoch_ms());
+        assert!(
+            store.contains(&live_id),
+            "the live future-dated bundle survives a real-clock prune"
         );
     }
 
@@ -1856,5 +1911,429 @@ mod tests {
             !is_fresh(1_000, 200_000, 90_000),
             "past ttl is stale (offline)"
         );
+    }
+
+    #[test]
+    fn freshness_never_underflows_with_a_future_heartbeat() {
+        // is_fresh uses saturating_sub: a heartbeat clock AHEAD of the reader's `now` (clock skew
+        // between regions) must read as fresh, not wrap around to a huge stale value. A raw
+        // `now - heartbeat` would panic/underflow here.
+        assert!(
+            is_fresh(/*heartbeat*/ 5_000, /*now*/ 1_000, /*ttl*/ 90_000),
+            "a heartbeat from a clock ahead of us is still fresh, not a wrapped-underflow stale"
+        );
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Store-trait passthroughs against the injected fake (stores-11 seam). These assert the
+    // FirestoreStore forwards to its in-memory hot path AND mirrors the right durable op, which is
+    // the whole contract: the relay reads memory, Firestore just has to agree.
+    // ------------------------------------------------------------------------------------------
+
+    #[test]
+    fn have_and_get_reflect_held_bundles_after_put_and_remove() {
+        // have()/get()/contains() must track exactly what put()/remove() changed. A regression that
+        // mirrored durably but forgot the in-memory hot path would fail here (the relay reads memory).
+        let mut store = FirestoreStore::open_with_mirror(FakeMirror::default()).unwrap();
+        let a = sample(4);
+        let a_id = a.id();
+        let b = sample(4);
+        let b_id = b.id();
+
+        assert!(store.get(&a_id).is_none(), "nothing held before put");
+        assert!(store.have().ids.is_empty(), "have() empty before put");
+
+        assert!(store.put(a, 1_000));
+        assert!(store.put(b, 1_000));
+        assert!(store.contains(&a_id) && store.contains(&b_id));
+        assert!(store.get(&a_id).is_some(), "get returns the held bundle");
+        let mut held = store.have().ids;
+        held.sort();
+        let mut want = vec![a_id, b_id];
+        want.sort();
+        assert_eq!(held, want, "have() lists exactly the two held ids");
+
+        assert!(store.remove(&a_id).is_some());
+        assert!(!store.contains(&a_id), "removed id no longer held");
+        assert_eq!(store.have().ids, vec![b_id], "have() drops the removed id");
+        // seen() outlives remove() (dedup window is retained past custody handoff).
+        assert!(store.seen(&a_id), "removed bundle is still deduped (seen)");
+    }
+
+    #[test]
+    fn seen_expiry_exposes_the_receiver_anchored_deadline() {
+        // stores-r3-01: seen_expiry must surface the SAME clamped now+lifetime the durable put()
+        // mirrored, so the handoff/spool path anchors Firestore's expireAt to the receiver clock.
+        let mut store = FirestoreStore::open_with_mirror(FakeMirror::default()).unwrap();
+        let lifetime_ms: u32 = 3_600_000;
+        let now_ms: u64 = 50_000_000_000;
+        let b = sample_with(4, /*created_at=*/ 0, lifetime_ms);
+        let id = b.id();
+        assert!(
+            store.seen_expiry(&id).is_none(),
+            "unknown id has no deadline"
+        );
+        assert!(store.put(b, now_ms));
+        assert_eq!(
+            store.seen_expiry(&id),
+            Some(now_ms + lifetime_ms as u64),
+            "seen_expiry is the receiver-anchored now+lifetime, the durable TTL anchor"
+        );
+    }
+
+    #[test]
+    fn put_returning_false_for_a_duplicate_does_not_mirror_twice() {
+        // put() must mirror a durable Write only when the in-memory put actually stored the bundle.
+        // A second put() of the same id inside the dedup window returns false and must NOT enqueue a
+        // second mirror op (else a duplicate flood would re-write Firestore per copy).
+        let mirror = FakeMirror::default();
+        let ops = mirror.ops.clone();
+        let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
+
+        // Build one bundle, keep its bytes so we can submit the identical id twice.
+        let b = sample(4);
+        let id = b.id();
+        let again = Bundle::from_bytes(&b.to_bytes().unwrap()).unwrap();
+
+        assert!(store.put(b, 1_000), "first put stores it");
+        assert!(!store.put(again, 1_000), "second put is a dedup (false)");
+        assert!(store.flush(Duration::from_secs(5)));
+
+        let puts: Vec<_> = ops
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| matches!(op, MirrorOp::Put { id: i, .. } if *i == id))
+            .cloned()
+            .collect();
+        assert_eq!(
+            puts.len(),
+            1,
+            "a deduped put must mirror exactly once, not twice"
+        );
+    }
+
+    #[test]
+    fn split_copies_at_one_does_not_remirror() {
+        // split_copies returns 0 when the budget is 1 (nothing to hand out). remirror() must be
+        // skipped in that case -- a spurious re-mirror of an un-split bundle is wasted durable I/O.
+        let mirror = FakeMirror::default();
+        let ops = mirror.ops.clone();
+        let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
+
+        let b = sample(1); // single copy: split hands out floor(1/2) = 0
+        let id = b.id();
+        assert!(store.put(b, 1_000));
+        assert!(store.flush(Duration::from_secs(5)));
+        let puts_before = ops
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| matches!(op, MirrorOp::Put { .. }))
+            .count();
+
+        assert_eq!(store.split_copies(&id), 0, "a 1-copy bundle splits to 0");
+        assert!(store.flush(Duration::from_secs(5)));
+        let puts_after = ops
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| matches!(op, MirrorOp::Put { .. }))
+            .count();
+        assert_eq!(
+            puts_before, puts_after,
+            "split_copies==0 must NOT re-mirror the bundle"
+        );
+    }
+
+    #[test]
+    fn mirror_dropped_handle_shares_the_live_counter() {
+        // The /healthz supervisor reads the dropped counter via a shared handle from ANOTHER thread
+        // without owning the driver-owned store. The handle must observe the SAME atomic the store
+        // bumps, not a detached snapshot.
+        let store = FirestoreStore::open_with_mirror(FakeMirror::default()).unwrap();
+        let handle = store.mirror_dropped_handle();
+        assert_eq!(handle.load(Ordering::Relaxed), 0);
+        // Bump the counter the same way backpressure does; the handle must see it live.
+        store.dropped.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(
+            handle.load(Ordering::Relaxed),
+            3,
+            "the handle aliases the store's live dropped counter"
+        );
+        assert_eq!(store.mirror_dropped(), 3, "and mirror_dropped() agrees");
+    }
+
+    /// A mirror that FAILS its first `fail_first` put attempts per op, then succeeds. Used to prove
+    /// the worker's retry loop actually re-attempts and eventually persists (stores durability under
+    /// a transient blip, not a permanent outage).
+    #[derive(Clone)]
+    struct FlakyMirror {
+        fail_first: u64,
+        attempts: Arc<AtomicU64>,
+        succeeded: Arc<Mutex<Vec<BundleId>>>,
+    }
+    impl BundleMirror for FlakyMirror {
+        fn list_bundles(&self) -> std::result::Result<Vec<(Vec<u8>, u64)>, String> {
+            Ok(Vec::new())
+        }
+        fn put_bundle(
+            &self,
+            id: &BundleId,
+            _data: &[u8],
+            _e: u64,
+        ) -> std::result::Result<(), String> {
+            let n = self.attempts.fetch_add(1, Ordering::Relaxed);
+            if n < self.fail_first {
+                Err("transient".into())
+            } else {
+                self.succeeded.lock().unwrap().push(*id);
+                Ok(())
+            }
+        }
+        fn delete_bundle(&self, _id: &BundleId) -> std::result::Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn worker_retries_a_transient_failure_and_eventually_persists() {
+        // The background writer retries a failed mirror op (up to 3 attempts, backing off). A backend
+        // that fails once then recovers must still get the durable write, not drop it after the first
+        // error. This exercises the retry branch (attempt loop) end-to-end.
+        let mirror = FlakyMirror {
+            fail_first: 1, // fail the first attempt, succeed the second
+            attempts: Arc::new(AtomicU64::new(0)),
+            succeeded: Arc::new(Mutex::new(Vec::new())),
+        };
+        let attempts = mirror.attempts.clone();
+        let succeeded = mirror.succeeded.clone();
+        let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
+
+        let b = sample(4);
+        let id = b.id();
+        assert!(store.put(b, 1_000));
+        assert!(
+            store.flush(Duration::from_secs(5)),
+            "flush drains after the retry succeeds"
+        );
+
+        assert!(
+            attempts.load(Ordering::Relaxed) >= 2,
+            "the worker re-attempted after the first failure"
+        );
+        assert_eq!(
+            succeeded.lock().unwrap().as_slice(),
+            &[id],
+            "the op was persisted on the retry, not dropped after the first error"
+        );
+    }
+
+    /// A mirror whose first put_bundle blocks until released, so the worker parks on that op and the
+    /// FIFO behind it (including a Flush sentinel) can't drain. Used to prove flush() honors its
+    /// timeout instead of hanging when the writer is stuck on a wedged backend.
+    #[derive(Clone)]
+    struct BlockingMirror {
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+    impl BundleMirror for BlockingMirror {
+        fn list_bundles(&self) -> std::result::Result<Vec<(Vec<u8>, u64)>, String> {
+            Ok(Vec::new())
+        }
+        fn put_bundle(
+            &self,
+            _id: &BundleId,
+            _d: &[u8],
+            _e: u64,
+        ) -> std::result::Result<(), String> {
+            // Park here until the test releases the gate, wedging the single writer thread.
+            let (lock, cvar) = &*self.gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cvar.wait(released).unwrap();
+            }
+            Ok(())
+        }
+        fn delete_bundle(&self, _id: &BundleId) -> std::result::Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn flush_times_out_when_the_worker_is_wedged() {
+        // flush() must return FALSE (not hang) when the writer can't drain in time. We wedge the
+        // worker on a blocking put_bundle so the Flush sentinel behind it never gets acked; the
+        // recv_timeout must expire and flush() reports failure. Then we release the gate and a second
+        // flush must succeed, proving the store recovers once the backend un-wedges.
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let mirror = BlockingMirror { gate: gate.clone() };
+        let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
+
+        // Enqueue a put the worker will block on, so everything behind it (the flush sentinel) waits.
+        assert!(store.put(sample(4), 1_000));
+
+        let start = Instant::now();
+        let ok = store.flush(Duration::from_millis(150));
+        let elapsed = start.elapsed();
+        assert!(!ok, "flush must report failure while the writer is wedged");
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "flush waited out its timeout, not returned early"
+        );
+
+        // Release the wedged worker; the backlog drains and a fresh flush now succeeds.
+        {
+            let (lock, cvar) = &*gate;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        assert!(
+            store.flush(Duration::from_secs(5)),
+            "flush succeeds once the backend un-wedges and the backlog drains"
+        );
+    }
+
+    #[test]
+    fn default_bundle_mirror_kv_methods_are_noop_ok() {
+        // A bundle-only backend (no kv surface) must compile AND behave: the default kv methods
+        // return an empty listing and succeed silently, so a FirestoreStore over such a mirror still
+        // opens and its kv writes never error out the worker.
+        struct BundleOnly;
+        impl BundleMirror for BundleOnly {
+            fn list_bundles(&self) -> std::result::Result<Vec<(Vec<u8>, u64)>, String> {
+                Ok(Vec::new())
+            }
+            fn put_bundle(
+                &self,
+                _id: &BundleId,
+                _d: &[u8],
+                _e: u64,
+            ) -> std::result::Result<(), String> {
+                Ok(())
+            }
+            fn delete_bundle(&self, _id: &BundleId) -> std::result::Result<(), String> {
+                Ok(())
+            }
+            // kv methods intentionally NOT overridden -> exercise the trait defaults.
+        }
+        let m = BundleOnly;
+        assert!(m.list_kv().unwrap().is_empty(), "default list_kv is empty");
+        assert!(m.put_kv("k", b"v").is_ok(), "default put_kv is ok");
+        assert!(m.delete_kv("k").is_ok(), "default delete_kv is ok");
+
+        // And a store over it opens (rehydrates zero kv) and mirrors a kv write without wedging.
+        let mut store = FirestoreStore::open_with_mirror(BundleOnly).unwrap();
+        store.put_kv("session/x", b"s".to_vec());
+        assert_eq!(store.get_kv("session/x"), Some(b"s".to_vec()));
+        assert!(
+            store.flush(Duration::from_secs(5)),
+            "kv write drains against a default (no-op) kv backend"
+        );
+    }
+
+    #[test]
+    fn open_rehydrates_both_bundles_and_kv_together() {
+        // open() loads BOTH durable surfaces: a live bundle listing AND the kv side store, in one
+        // pass. A cold-started relay must come back with its held mailbox and its forward-secret
+        // sessions, so this asserts both are present after a fresh open over pre-populated state.
+        let live = sample(4);
+        let live_id = live.id();
+        let far_future = epoch_ms() + 60 * 60 * 1000;
+        let kv = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+        kv.lock()
+            .unwrap()
+            .insert("session/peerZ".to_string(), b"ratchet".to_vec());
+        let mirror = FakeMirror {
+            listing: vec![(live.to_bytes().unwrap(), far_future)],
+            ops: Arc::new(Mutex::new(Vec::new())),
+            kv,
+        };
+        let store = FirestoreStore::open_with_mirror(mirror).unwrap();
+        assert!(store.contains(&live_id), "held bundle rehydrated on open");
+        assert_eq!(
+            store.get_kv("session/peerZ"),
+            Some(b"ratchet".to_vec()),
+            "kv session rehydrated on open in the same pass"
+        );
+    }
+
+    #[test]
+    fn registry_doc_carries_a_ttl_timestamp_and_survives_a_roundtrip() {
+        // F-20: a registry heartbeat doc must carry an `expireAt` timestampValue (the ONLY field the
+        // Firestore TTL policy sweeps) set to heartbeat + PRESENCE_DOC_TTL_MS, so stale registry rows
+        // self-expire instead of retaining an indefinite node->region log. Also assert the integer
+        // fields round-trip through parse.
+        let hb: u64 = 1_700_000_000_000; // 2023-11-14T22:13:20Z
+        let json = registry_doc_json("N1", "us-central1", "wss://x/", hb);
+        assert_eq!(
+            json["fields"]["expireAt"]["timestampValue"],
+            rfc3339_utc(hb + PRESENCE_DOC_TTL_MS),
+            "registry TTL timestamp is heartbeat + 1h"
+        );
+        let doc = serde_json::json!({ "name": "x", "fields": json["fields"] });
+        let p = parse_registry_doc(&doc).unwrap();
+        assert_eq!((p.node.as_str(), p.heartbeat_ms), ("N1", hb));
+    }
+
+    #[test]
+    fn presence_doc_carries_a_ttl_timestamp() {
+        // F-20 twin for presence: the location record must self-expire via an `expireAt`
+        // timestampValue at heartbeat + PRESENCE_DOC_TTL_MS (DESIGN §33: no indefinite location log).
+        let hb: u64 = 1_700_000_000_000;
+        let json = presence_doc_json("Dev1", "eu-west1", hb);
+        assert_eq!(
+            json["fields"]["expireAt"]["timestampValue"],
+            rfc3339_utc(hb + PRESENCE_DOC_TTL_MS),
+            "presence TTL timestamp is heartbeat + 1h"
+        );
+    }
+
+    #[test]
+    fn parse_kv_doc_rejects_a_doc_missing_the_value() {
+        // parse_kv_doc must reject a malformed doc (key present, value bytes missing) rather than
+        // panic or invent an empty value -- a half-written kv row must be skipped on rehydrate.
+        let doc = serde_json::json!({
+            "name": "x",
+            "fields": { "key": { "stringValue": "session/x" } }
+        });
+        assert!(
+            parse_kv_doc(&doc).is_none(),
+            "a kv doc with no value bytes is rejected"
+        );
+        // Non-base64 value bytes are also rejected (corrupt row, not a panic).
+        let doc2 = serde_json::json!({
+            "name": "x",
+            "fields": {
+                "key": { "stringValue": "session/x" },
+                "value": { "bytesValue": "!!!not base64!!!" }
+            }
+        });
+        assert!(
+            parse_kv_doc(&doc2).is_none(),
+            "corrupt value bytes rejected"
+        );
+    }
+
+    #[test]
+    fn rehydrate_skips_a_corrupt_bundle_but_keeps_the_good_one() {
+        // A durable listing may contain a row whose bytes don't decode as a Bundle (corruption or a
+        // future wire version). Rehydrate must skip it and still load the well-formed neighbours,
+        // rather than aborting the whole open.
+        let good = sample(4);
+        let good_id = good.id();
+        let far_future = epoch_ms() + 60 * 60 * 1000;
+        let mirror = FakeMirror {
+            listing: vec![
+                (b"not a bundle at all".to_vec(), far_future),
+                (good.to_bytes().unwrap(), far_future),
+            ],
+            ..Default::default()
+        };
+        let store = FirestoreStore::open_with_mirror(mirror).unwrap();
+        assert!(
+            store.contains(&good_id),
+            "the well-formed bundle rehydrated despite a corrupt sibling"
+        );
+        assert_eq!(store.have().ids, vec![good_id], "only the good one is held");
     }
 }
