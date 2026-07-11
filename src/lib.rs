@@ -902,6 +902,10 @@ pub struct DevicePresence {
 pub struct Presence {
     http: reqwest::blocking::Client,
     project: String,
+    /// The Firestore REST base (`https://firestore.googleapis.com/v1` in production). A field, not a
+    /// per-method literal, so the cross-partition URL builders below share one origin and tests can
+    /// point them at a loopback responder.
+    base: String,
     presence_url: String, // .../documents/presence
     token: Mutex<Option<(String, Instant)>>,
 }
@@ -917,6 +921,7 @@ impl Presence {
                 .build()
                 .expect("http client"),
             project: project.to_string(),
+            base: base.to_string(),
             presence_url,
             token: Mutex::new(None),
         }
@@ -979,7 +984,7 @@ impl Presence {
     /// cross-partition handoffs that landed after it started (cold starts get them via
     /// the store's rehydrate instead).
     pub fn list_bundles_of(&self, node: &str) -> Result<Vec<(Vec<u8>, u64)>, String> {
-        let base = "https://firestore.googleapis.com/v1";
+        let base = &self.base;
         let collection_url = format!(
             "{base}/projects/{}/databases/(default)/documents/relays/{node}/bundles",
             self.project
@@ -1030,7 +1035,7 @@ impl Presence {
         data: &[u8],
         expires_at: u64,
     ) -> Result<(), String> {
-        let base = "https://firestore.googleapis.com/v1";
+        let base = &self.base;
         let doc = bs58::encode(id).into_string();
         let url = format!(
             "{base}/projects/{}/databases/(default)/documents/relays/{node}/bundles/{doc}",
@@ -1066,7 +1071,7 @@ impl Presence {
         data: &[u8],
         expires_at: u64,
     ) -> Result<(), String> {
-        let base = "https://firestore.googleapis.com/v1";
+        let base = &self.base;
         let doc = bs58::encode(id).into_string();
         let url = format!(
             "{base}/projects/{}/databases/(default)/documents/mailboxes/{tag_b58}/bundles/{doc}",
@@ -1091,7 +1096,7 @@ impl Presence {
     /// §39 P5: list a mailbox-tag's spooled private bundles, as `(sealed bytes, expires_at)`. Pulled
     /// when that recipient's want-beacon arrives (it then re-ingests them; P4's gradient steers each).
     pub fn list_mailbox(&self, tag_b58: &str) -> Result<Vec<(Vec<u8>, u64)>, String> {
-        let base = "https://firestore.googleapis.com/v1";
+        let base = &self.base;
         let collection_url = format!(
             "{base}/projects/{}/databases/(default)/documents/mailboxes/{tag_b58}/bundles",
             self.project
@@ -1135,7 +1140,7 @@ impl Presence {
     /// §39 P5: drop one spooled bundle after it's been pulled (the recipient is now reachable, so
     /// P4's live gradient delivers it). Idempotent — a 404 (already gone / TTL-swept) is fine.
     pub fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String> {
-        let base = "https://firestore.googleapis.com/v1";
+        let base = &self.base;
         let doc = bs58::encode(id).into_string();
         let url = format!(
             "{base}/projects/{}/databases/(default)/documents/mailboxes/{tag_b58}/bundles/{doc}",
@@ -2335,5 +2340,546 @@ mod tests {
             "the well-formed bundle rehydrated despite a corrupt sibling"
         );
         assert_eq!(store.have().ids, vec![good_id], "only the good one is held");
+    }
+
+    // ==========================================================================================
+    // Loopback HTTP coverage (cov/firestore): the REST request-build + response-parse paths of
+    // FirestoreClient / Registry / Presence run against a tiny std-only 127.0.0.1 responder. Each
+    // client is built with its private URL fields pointed at the mock and a PRE-SEEDED token cache,
+    // so no metadata-server or live-network call is ever made. This exercises the durability-mirror
+    // wire code (methods/paths/bodies out, status/paging/parse back) without touching Firestore.
+    // ==========================================================================================
+
+    struct RecordedRequest {
+        method: String,
+        target: String, // request-target incl. query string
+        body: String,
+    }
+
+    struct MockServer {
+        base: String, // e.g. "http://127.0.0.1:54321"
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    }
+
+    /// Spawn a loopback HTTP responder that replies with `responses` (status, json body) in order,
+    /// recording each request. Beyond the scripted list it replies `200 {}`. Each response closes the
+    /// connection (`Connection: close`) so there is no keep-alive bookkeeping.
+    fn spawn_mock(responses: Vec<(u16, String)>) -> MockServer {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let sink = requests.clone();
+        std::thread::spawn(move || {
+            let mut idx = 0usize;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let target = parts.next().unwrap_or("").to_string();
+                let mut content_length = 0usize;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0
+                        || header == "\r\n"
+                        || header == "\n"
+                    {
+                        break;
+                    }
+                    if let Some(v) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 {
+                    let _ = reader.read_exact(&mut body);
+                }
+                sink.lock().unwrap().push(RecordedRequest {
+                    method,
+                    target,
+                    body: String::from_utf8_lossy(&body).into_owned(),
+                });
+                let (code, resp_body) = responses.get(idx).cloned().unwrap_or((200, "{}".into()));
+                idx += 1;
+                let resp = format!(
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                    resp_body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        MockServer { base, requests }
+    }
+
+    fn test_http() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+    }
+
+    fn seeded_token() -> Mutex<Option<(String, Instant)>> {
+        // A fresh cached token, so token() returns it without any metadata-server round-trip.
+        Mutex::new(Some(("test-token".to_string(), Instant::now())))
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// A Firestore document as the list REST endpoint returns it (fields parse_doc reads).
+    fn firestore_doc(data: &[u8], expires_at: u64) -> serde_json::Value {
+        serde_json::json!({
+            "name": "projects/p/.../x",
+            "fields": {
+                "data": { "bytesValue": b64(data) },
+                "expiresAt": { "integerValue": expires_at.to_string() },
+            }
+        })
+    }
+
+    fn firestore_client_at(base: &str) -> FirestoreClient {
+        FirestoreClient {
+            http: test_http(),
+            collection_url: format!("{base}/documents/relays/NODE/bundles"),
+            kv_url: format!("{base}/documents/relays/NODE/kv"),
+            token: seeded_token(),
+        }
+    }
+
+    fn registry_at(base: &str, me: &str) -> Registry {
+        Registry {
+            http: test_http(),
+            collection_url: format!("{base}/documents/registry"),
+            me: me.to_string(),
+            token: seeded_token(),
+        }
+    }
+
+    fn presence_at(base: &str) -> Presence {
+        Presence {
+            http: test_http(),
+            project: "proj".to_string(),
+            base: base.to_string(),
+            presence_url: format!("{base}/documents/presence"),
+            token: seeded_token(),
+        }
+    }
+
+    #[test]
+    fn firestore_put_bundle_patches_the_doc_and_maps_errors() {
+        let id = sample(1).id();
+        // Success: a 200 is Ok, and the request is a PATCH to /bundles/<bs58 id> carrying the doc body
+        // (base64 data + integer expiresAt). Drive it through the trait to cover the delegation too.
+        let srv = spawn_mock(vec![(200, "{}".into())]);
+        let client = firestore_client_at(&srv.base);
+        let mirror: &dyn BundleMirror = &client;
+        assert!(mirror.put_bundle(&id, b"sealed", 4242).is_ok());
+        {
+            let reqs = srv.requests.lock().unwrap();
+            assert_eq!(reqs.len(), 1);
+            assert_eq!(reqs[0].method, "PATCH");
+            assert!(reqs[0]
+                .target
+                .contains(&format!("/bundles/{}", bs58::encode(id).into_string())));
+            let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+            assert_eq!(body["fields"]["expiresAt"]["integerValue"], "4242");
+            assert_eq!(
+                body["fields"]["data"]["bytesValue"].as_str(),
+                Some(b64(b"sealed").as_str())
+            );
+        }
+        // Error: a 500 maps to Err (the write is not silently swallowed).
+        let srv2 = spawn_mock(vec![(500, "boom".into())]);
+        assert!(firestore_client_at(&srv2.base)
+            .put_bundle(&id, b"x", 1)
+            .is_err());
+    }
+
+    #[test]
+    fn firestore_delete_bundle_treats_success_and_404_as_ok_but_errors_otherwise() {
+        let id = sample(1).id();
+        for code in [200u16, 404] {
+            let srv = spawn_mock(vec![(code, "{}".into())]);
+            let client = firestore_client_at(&srv.base);
+            let mirror: &dyn BundleMirror = &client;
+            assert!(mirror.delete_bundle(&id).is_ok(), "status {code} is ok");
+            assert_eq!(srv.requests.lock().unwrap()[0].method, "DELETE");
+        }
+        let srv = spawn_mock(vec![(500, "no".into())]);
+        assert!(
+            firestore_client_at(&srv.base).delete_bundle(&id).is_err(),
+            "a 500 delete maps to Err"
+        );
+    }
+
+    #[test]
+    fn firestore_list_bundles_pages_parses_and_handles_404() {
+        // Two pages: the first carries a nextPageToken, the second ends the loop. Both docs parse.
+        let page1 = serde_json::json!({
+            "documents": [firestore_doc(b"one", 111)],
+            "nextPageToken": "PAGE2"
+        })
+        .to_string();
+        let page2 = serde_json::json!({ "documents": [firestore_doc(b"two", 222)] }).to_string();
+        let srv = spawn_mock(vec![(200, page1), (200, page2)]);
+        let client = firestore_client_at(&srv.base);
+        let mirror: &dyn BundleMirror = &client;
+        let out = mirror.list_bundles().unwrap();
+        assert_eq!(out, vec![(b"one".to_vec(), 111), (b"two".to_vec(), 222)]);
+        {
+            let reqs = srv.requests.lock().unwrap();
+            assert_eq!(reqs.len(), 2, "followed the page token to a second request");
+            assert!(reqs[1].target.contains("pageToken=PAGE2"));
+        }
+        // A 404 means the collection doesn't exist yet -> empty, not an error.
+        let srv404 = spawn_mock(vec![(404, String::new())]);
+        assert!(firestore_client_at(&srv404.base)
+            .list_bundles()
+            .unwrap()
+            .is_empty());
+        // Any other non-success status is an error.
+        let srv500 = spawn_mock(vec![(500, String::new())]);
+        assert!(firestore_client_at(&srv500.base).list_bundles().is_err());
+    }
+
+    #[test]
+    fn firestore_kv_put_and_delete_over_rest() {
+        // put_kv PATCHes a doc whose id is bs58(key-bytes) and carries the ORIGINAL key + value.
+        let srv = spawn_mock(vec![(200, "{}".into())]);
+        let client = firestore_client_at(&srv.base);
+        let mirror: &dyn BundleMirror = &client;
+        assert!(mirror.put_kv("session/peerX", b"ratchet").is_ok());
+        {
+            let reqs = srv.requests.lock().unwrap();
+            assert_eq!(reqs[0].method, "PATCH");
+            assert!(reqs[0].target.contains(&format!(
+                "/kv/{}",
+                bs58::encode("session/peerX".as_bytes()).into_string()
+            )));
+            let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+            assert_eq!(body["fields"]["key"]["stringValue"], "session/peerX");
+        }
+        // delete_kv: a 404 is fine (already gone); a 500 is an error; put_kv 500 is an error.
+        let srv404 = spawn_mock(vec![(404, String::new())]);
+        assert!(firestore_client_at(&srv404.base).delete_kv("k").is_ok());
+        let srv500 = spawn_mock(vec![(500, String::new())]);
+        assert!(firestore_client_at(&srv500.base).delete_kv("k").is_err());
+        let srvp = spawn_mock(vec![(500, String::new())]);
+        assert!(firestore_client_at(&srvp.base).put_kv("k", b"v").is_err());
+    }
+
+    #[test]
+    fn firestore_list_kv_pages_parses_and_handles_404() {
+        let kv_doc = |k: &str, v: &[u8]| {
+            serde_json::json!({
+                "name": "x",
+                "fields": { "key": { "stringValue": k }, "value": { "bytesValue": b64(v) } }
+            })
+        };
+        let page1 = serde_json::json!({
+            "documents": [kv_doc("session/a", b"aa")],
+            "nextPageToken": "P2"
+        })
+        .to_string();
+        let page2 = serde_json::json!({ "documents": [kv_doc("prekey/b", b"bb")] }).to_string();
+        let srv = spawn_mock(vec![(200, page1), (200, page2)]);
+        let client = firestore_client_at(&srv.base);
+        let mirror: &dyn BundleMirror = &client;
+        let mut out = mirror.list_kv().unwrap();
+        out.sort();
+        assert_eq!(
+            out,
+            vec![
+                ("prekey/b".to_string(), b"bb".to_vec()),
+                ("session/a".to_string(), b"aa".to_vec()),
+            ]
+        );
+        assert!(srv.requests.lock().unwrap()[1]
+            .target
+            .contains("pageToken=P2"));
+
+        let srv404 = spawn_mock(vec![(404, String::new())]);
+        assert!(firestore_client_at(&srv404.base)
+            .list_kv()
+            .unwrap()
+            .is_empty());
+        let srv500 = spawn_mock(vec![(500, String::new())]);
+        assert!(firestore_client_at(&srv500.base).list_kv().is_err());
+    }
+
+    #[test]
+    fn firestore_client_new_builds_per_node_urls() {
+        let addr = [1u8, 2, 3, 4];
+        let node = bs58::encode(addr).into_string();
+        let client = FirestoreClient::new("my-proj", &addr);
+        assert!(client.collection_url.ends_with(&format!(
+            "/projects/my-proj/databases/(default)/documents/relays/{node}/bundles"
+        )));
+        assert!(client.kv_url.ends_with(&format!("/relays/{node}/kv")));
+    }
+
+    #[test]
+    fn gcp_token_env_var_and_cache_paths() {
+        // This is the ONLY test touching FIRESTORE_ACCESS_TOKEN, and no other test triggers a fetch
+        // (they all pre-seed a fresh token), so there is no cross-test env race.
+        std::env::set_var("FIRESTORE_ACCESS_TOKEN", "env-tok");
+        let http = test_http();
+        // fetch_gcp_token short-circuits on the env var before any metadata call.
+        assert_eq!(fetch_gcp_token(&http).unwrap(), "env-tok");
+        // cached_token on an EMPTY cache fetches (via env), stores, and returns it.
+        let empty: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+        assert_eq!(cached_token(&empty, &http).unwrap(), "env-tok");
+        assert!(
+            empty.lock().unwrap().is_some(),
+            "token cached after the fetch"
+        );
+        // An EXPIRED cache entry forces a refetch (kept deterministic via the env var).
+        std::env::set_var("FIRESTORE_ACCESS_TOKEN", "fresh-env");
+        let expired: Mutex<Option<(String, Instant)>> = Mutex::new(Some((
+            "old".into(),
+            Instant::now() - Duration::from_secs(3001),
+        )));
+        assert_eq!(
+            cached_token(&expired, &http).unwrap(),
+            "fresh-env",
+            "an expired cache re-fetches rather than returning the stale token"
+        );
+        std::env::remove_var("FIRESTORE_ACCESS_TOKEN");
+        // A FRESH cache entry is returned without any fetch (env var now gone, yet this still works).
+        let fresh: Mutex<Option<(String, Instant)>> =
+            Mutex::new(Some(("cached".into(), Instant::now())));
+        assert_eq!(cached_token(&fresh, &http).unwrap(), "cached");
+    }
+
+    #[test]
+    fn registry_heartbeat_patches_and_maps_errors() {
+        let srv = spawn_mock(vec![(200, "{}".into())]);
+        let reg = registry_at(&srv.base, "MeNode");
+        assert!(reg.heartbeat("eu-west1", "wss://eu/", 9_000).is_ok());
+        {
+            let reqs = srv.requests.lock().unwrap();
+            assert_eq!(reqs[0].method, "PATCH");
+            assert!(reqs[0].target.contains("/registry/MeNode"));
+            let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+            assert_eq!(body["fields"]["region"]["stringValue"], "eu-west1");
+            assert_eq!(body["fields"]["endpoint"]["stringValue"], "wss://eu/");
+        }
+        let srv2 = spawn_mock(vec![(500, String::new())]);
+        assert!(registry_at(&srv2.base, "MeNode")
+            .heartbeat("r", "e", 1)
+            .is_err());
+    }
+
+    #[test]
+    fn registry_online_filters_self_and_stale_peers() {
+        let now = 1_000_000u64;
+        let ttl = 90_000u64;
+        let reg_doc = |node: &str, region: &str, endpoint: &str, hb: u64| {
+            serde_json::json!({
+                "name": "x",
+                "fields": {
+                    "node": { "stringValue": node },
+                    "region": { "stringValue": region },
+                    "endpoint": { "stringValue": endpoint },
+                    "heartbeatAt": { "integerValue": hb.to_string() },
+                }
+            })
+        };
+        let docs = serde_json::json!({
+            "documents": [
+                reg_doc("MeNode", "r0", "e0", now),                 // ourselves -> excluded
+                reg_doc("StalePeer", "r1", "e1", now - ttl - 1),    // too old -> excluded
+                reg_doc("FreshPeer", "eu", "wss://eu/", now - 1_000) // fresh non-self -> kept
+            ]
+        })
+        .to_string();
+        let srv = spawn_mock(vec![(200, docs)]);
+        let online = registry_at(&srv.base, "MeNode").online(now, ttl).unwrap();
+        assert_eq!(
+            online.len(),
+            1,
+            "only the fresh non-self peer survives the filter"
+        );
+        assert_eq!(online[0].node, "FreshPeer");
+        assert_eq!(online[0].region, "eu");
+        assert_eq!(online[0].endpoint, "wss://eu/");
+
+        // 404 -> empty (no registry yet); any other error -> Err.
+        let srv404 = spawn_mock(vec![(404, String::new())]);
+        assert!(registry_at(&srv404.base, "Me")
+            .online(now, ttl)
+            .unwrap()
+            .is_empty());
+        let srv500 = spawn_mock(vec![(500, String::new())]);
+        assert!(registry_at(&srv500.base, "Me").online(now, ttl).is_err());
+    }
+
+    #[test]
+    fn registry_new_builds_registry_url() {
+        let addr = [9u8, 9, 9];
+        let reg = Registry::new("proj-x", &addr);
+        assert!(reg
+            .collection_url
+            .ends_with("/projects/proj-x/databases/(default)/documents/registry"));
+        assert_eq!(reg.me, bs58::encode(addr).into_string());
+    }
+
+    #[test]
+    fn presence_set_presence_patches_and_maps_errors() {
+        let srv = spawn_mock(vec![(200, "{}".into())]);
+        let presence = presence_at(&srv.base);
+        assert!(presence.set_presence("Dev1", "eu-west1", 5_000).is_ok());
+        {
+            let reqs = srv.requests.lock().unwrap();
+            assert_eq!(reqs[0].method, "PATCH");
+            assert!(reqs[0].target.contains("/presence/Dev1"));
+            let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+            assert_eq!(body["fields"]["region"]["stringValue"], "eu-west1");
+        }
+        let srv2 = spawn_mock(vec![(500, String::new())]);
+        assert!(presence_at(&srv2.base).set_presence("D", "r", 1).is_err());
+    }
+
+    #[test]
+    fn presence_region_of_returns_fresh_stale_and_missing() {
+        let now = 2_000_000u64;
+        let ttl = 90_000u64;
+        let pdoc = |region: &str, hb: u64| {
+            serde_json::json!({
+                "name": "x",
+                "fields": {
+                    "device": { "stringValue": "Dev1" },
+                    "region": { "stringValue": region },
+                    "heartbeatAt": { "integerValue": hb.to_string() },
+                }
+            })
+            .to_string()
+        };
+        // Fresh check-in -> Some(region).
+        let srv = spawn_mock(vec![(200, pdoc("eu", now - 1_000))]);
+        assert_eq!(
+            presence_at(&srv.base).region_of("Dev1", now, ttl).unwrap(),
+            Some("eu".to_string())
+        );
+        // Stale check-in -> None (offline, don't route there).
+        let srv2 = spawn_mock(vec![(200, pdoc("eu", now - ttl - 1))]);
+        assert_eq!(
+            presence_at(&srv2.base).region_of("Dev1", now, ttl).unwrap(),
+            None
+        );
+        // 404 -> None (unknown device); a 500 -> Err.
+        let srv404 = spawn_mock(vec![(404, String::new())]);
+        assert_eq!(
+            presence_at(&srv404.base)
+                .region_of("Dev1", now, ttl)
+                .unwrap(),
+            None
+        );
+        let srv500 = spawn_mock(vec![(500, String::new())]);
+        assert!(presence_at(&srv500.base)
+            .region_of("Dev1", now, ttl)
+            .is_err());
+    }
+
+    #[test]
+    fn presence_cross_partition_handoff_and_mailbox_paths() {
+        let id = sample(1).id();
+        let doc_id = bs58::encode(id).into_string();
+
+        // put_bundle_to: PATCH into relays/{node}/bundles/{doc} of the destination partition.
+        let srv = spawn_mock(vec![(200, "{}".into())]);
+        assert!(presence_at(&srv.base)
+            .put_bundle_to("NodeB", &id, b"data", 777)
+            .is_ok());
+        assert!(srv.requests.lock().unwrap()[0]
+            .target
+            .contains(&format!("/relays/NodeB/bundles/{doc_id}")));
+        let srve = spawn_mock(vec![(500, String::new())]);
+        assert!(presence_at(&srve.base)
+            .put_bundle_to("NodeB", &id, b"x", 1)
+            .is_err());
+
+        // list_bundles_of: pages + parse, then 404 -> empty and 500 -> err.
+        let page1 = serde_json::json!({
+            "documents": [firestore_doc(b"h1", 10)],
+            "nextPageToken": "N2"
+        })
+        .to_string();
+        let page2 = serde_json::json!({ "documents": [firestore_doc(b"h2", 20)] }).to_string();
+        let srvl = spawn_mock(vec![(200, page1), (200, page2)]);
+        let got = presence_at(&srvl.base).list_bundles_of("NodeB").unwrap();
+        assert_eq!(got, vec![(b"h1".to_vec(), 10), (b"h2".to_vec(), 20)]);
+        assert!(srvl.requests.lock().unwrap()[1]
+            .target
+            .contains("pageToken=N2"));
+        let srvl404 = spawn_mock(vec![(404, String::new())]);
+        assert!(presence_at(&srvl404.base)
+            .list_bundles_of("NodeB")
+            .unwrap()
+            .is_empty());
+        let srvl500 = spawn_mock(vec![(500, String::new())]);
+        assert!(presence_at(&srvl500.base).list_bundles_of("NodeB").is_err());
+
+        // spool_to_mailbox: PATCH into mailboxes/{tag}/bundles/{doc}; error maps through.
+        let srvs = spawn_mock(vec![(200, "{}".into())]);
+        assert!(presence_at(&srvs.base)
+            .spool_to_mailbox("TAG58", &id, b"m", 999)
+            .is_ok());
+        assert!(srvs.requests.lock().unwrap()[0]
+            .target
+            .contains(&format!("/mailboxes/TAG58/bundles/{doc_id}")));
+        let srvse = spawn_mock(vec![(500, String::new())]);
+        assert!(presence_at(&srvse.base)
+            .spool_to_mailbox("TAG58", &id, b"m", 1)
+            .is_err());
+
+        // list_mailbox: pages + parse, then 404 -> empty and 500 -> err.
+        let mp1 = serde_json::json!({
+            "documents": [firestore_doc(b"s1", 5)],
+            "nextPageToken": "M2"
+        })
+        .to_string();
+        let mp2 = serde_json::json!({ "documents": [firestore_doc(b"s2", 6)] }).to_string();
+        let srvm = spawn_mock(vec![(200, mp1), (200, mp2)]);
+        let mailbox = presence_at(&srvm.base).list_mailbox("TAG58").unwrap();
+        assert_eq!(mailbox, vec![(b"s1".to_vec(), 5), (b"s2".to_vec(), 6)]);
+        let srvm404 = spawn_mock(vec![(404, String::new())]);
+        assert!(presence_at(&srvm404.base)
+            .list_mailbox("TAG58")
+            .unwrap()
+            .is_empty());
+        let srvm500 = spawn_mock(vec![(500, String::new())]);
+        assert!(presence_at(&srvm500.base).list_mailbox("TAG58").is_err());
+
+        // delete_mailbox_bundle: success and 404 are both Ok (idempotent); 500 is an error.
+        for code in [200u16, 404] {
+            let srvd = spawn_mock(vec![(code, String::new())]);
+            assert!(presence_at(&srvd.base)
+                .delete_mailbox_bundle("TAG58", &id)
+                .is_ok());
+            assert_eq!(srvd.requests.lock().unwrap()[0].method, "DELETE");
+        }
+        let srvd500 = spawn_mock(vec![(500, String::new())]);
+        assert!(presence_at(&srvd500.base)
+            .delete_mailbox_bundle("TAG58", &id)
+            .is_err());
+    }
+
+    #[test]
+    fn presence_new_builds_presence_url_and_base() {
+        let presence = Presence::new("proj-y");
+        assert!(presence
+            .presence_url
+            .ends_with("/projects/proj-y/databases/(default)/documents/presence"));
+        assert_eq!(presence.base, "https://firestore.googleapis.com/v1");
+        assert_eq!(presence.project, "proj-y");
     }
 }
