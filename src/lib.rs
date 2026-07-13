@@ -396,6 +396,27 @@ impl Store for FirestoreStore {
         }
     }
 
+    fn rehydrate(&mut self, bundle: Bundle, now_ms: u64) -> bool {
+        // relay-A audit: re-hold an evicted-but-durable bundle whose `seen` row survived, and re-mirror
+        // it durably. Same shape as put but the in-memory inner re-holds past its dedup gate.
+        let id = bundle.id();
+        let lifetime = (bundle.inner.lifetime_ms as u64).min(hop_core::store::MAX_SEEN_LIFETIME_MS);
+        let expires_at = now_ms.saturating_add(lifetime);
+        let data = match bundle.to_bytes() {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        let held = self.inner.rehydrate(bundle, now_ms);
+        if held {
+            self.tx.send(Op::Write {
+                id,
+                data,
+                expires_at,
+            });
+        }
+        held
+    }
+
     fn get(&self, id: &BundleId) -> Option<Bundle> {
         self.inner.get(id)
     }
