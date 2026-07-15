@@ -83,7 +83,7 @@ enum Op {
     },
     /// F-21: drain sentinel. The worker acks this AFTER processing every op ahead of it (mpsc is
     /// FIFO), so `flush()` blocking on the ack means all pending mirrors have been attempted.
-    Flush(mpsc::SyncSender<()>),
+    Flush(mpsc::SyncSender<bool>),
 }
 
 /// The durable mirror seam behind [`FirestoreStore`] (stores-11). The real relay uses
@@ -149,6 +149,9 @@ pub struct FirestoreStore {
     /// Non-zero means Firestore is degraded and this store is NOT durable right now; `/healthz`
     /// surfaces it. `Arc` so a boxed store's owner can read it without owning the store.
     dropped: Arc<AtomicU64>,
+    /// Mirror operations that still failed after all retries. This is distinct from queue
+    /// backpressure: either counter means the in-memory store is no longer durably mirrored.
+    failed: Arc<AtomicU64>,
     /// stores-r2-05: the background writer's join handle. Drop signals `closed` then best-effort
     /// joins (bounded wait) so ops enqueued-but-not-yet-flushed on an UNCLEAN teardown (panic, early
     /// return, a drop not preceded by `flush()`) still get drained rather than silently lost. `Option`
@@ -208,6 +211,14 @@ impl FirestoreStore {
     /// `/healthz`) can read it from another thread without owning the (driver-owned) store.
     pub fn mirror_dropped_handle(&self) -> Arc<AtomicU64> {
         self.dropped.clone()
+    }
+
+    pub fn mirror_failed(&self) -> u64 {
+        self.failed.load(Ordering::Relaxed)
+    }
+
+    pub fn mirror_failed_handle(&self) -> Arc<AtomicU64> {
+        self.failed.clone()
     }
 
     /// stores-r2-01: re-mirror an already-held bundle (after a spray-and-wait split or a retransmit
@@ -277,6 +288,7 @@ impl FirestoreStore {
         }
 
         let dropped = Arc::new(AtomicU64::new(0));
+        let failed = Arc::new(AtomicU64::new(0));
         let queue = Arc::new((
             Mutex::new(MirrorQueue {
                 ops: std::collections::VecDeque::new(),
@@ -288,8 +300,10 @@ impl FirestoreStore {
             queue: queue.clone(),
             dropped: dropped.clone(),
         };
+        let writer_failed = failed.clone();
         let writer = std::thread::spawn(move || {
             let (lock, cvar) = &*queue;
+            let mut had_failure = false;
             loop {
                 let op = {
                     let mut q = lock.lock().unwrap();
@@ -305,10 +319,11 @@ impl FirestoreStore {
                 };
                 // F-21: a flush sentinel just acks — everything before it in the FIFO is done.
                 if let Op::Flush(ack) = &op {
-                    let _ = ack.send(());
+                    let _ = ack.send(!had_failure);
                     continue;
                 }
                 // Best-effort with a couple of retries; the hot path never blocks here.
+                let mut succeeded = false;
                 for attempt in 0..3 {
                     let ok = match &op {
                         Op::Write {
@@ -322,9 +337,14 @@ impl FirestoreStore {
                         Op::Flush(_) => break,
                     };
                     if ok.is_ok() {
+                        succeeded = true;
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(200 * (attempt + 1)));
+                }
+                if !succeeded {
+                    writer_failed.fetch_add(1, Ordering::Relaxed);
+                    had_failure = true;
                 }
             }
         });
@@ -333,6 +353,7 @@ impl FirestoreStore {
             inner,
             tx,
             dropped,
+            failed,
             writer: Some(writer),
         })
     }
@@ -497,9 +518,9 @@ impl Store for FirestoreStore {
     /// elapses). The queue is FIFO, so an acked Flush means every prior Write/Delete/kv op was
     /// attempted. The Flush sentinel is never drop-oldest'd (stores-09), so this can't wedge.
     fn flush(&self, timeout: std::time::Duration) -> bool {
-        let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(0);
+        let (ack_tx, ack_rx) = mpsc::sync_channel::<bool>(0);
         self.tx.send(Op::Flush(ack_tx));
-        ack_rx.recv_timeout(timeout).is_ok()
+        ack_rx.recv_timeout(timeout).unwrap_or(false)
     }
 }
 
@@ -2152,6 +2173,29 @@ mod tests {
             succeeded.lock().unwrap().as_slice(),
             &[id],
             "the op was persisted on the retry, not dropped after the first error"
+        );
+        assert_eq!(store.mirror_failed(), 0);
+    }
+
+    #[test]
+    fn exhausted_retries_make_health_and_flush_report_failure() {
+        let mirror = FlakyMirror {
+            fail_first: u64::MAX,
+            attempts: Arc::new(AtomicU64::new(0)),
+            succeeded: Arc::new(Mutex::new(Vec::new())),
+        };
+        let attempts = mirror.attempts.clone();
+        let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
+        let failed = store.mirror_failed_handle();
+
+        assert!(store.put(sample(91), 1_000));
+        assert!(!store.flush(Duration::from_secs(5)));
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(store.mirror_failed(), 1);
+        assert_eq!(failed.load(Ordering::Relaxed), 1);
+        assert!(
+            !store.flush(Duration::from_secs(5)),
+            "an earlier exhausted write must not be hidden by a later empty flush"
         );
     }
 
