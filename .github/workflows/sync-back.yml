@@ -1,0 +1,27 @@
+# Sync a public PR opened on this mirror back to the Hop monorepo (the source of truth). The PR is a
+# public discussion HERE; this workflow asks the monorepo to import it as a monorepo PR, which is where
+# it gets MERGED (monorepo main is branch-protected). The export then cascades the merged change back out
+# to this repo. Internal work is the mirror image: discussed + merged on a monorepo PR, cascaded out.
+#
+# The export cascades out as a push, which does not fire PR events, so this never loops, no guard needed.
+# This file is carried in from the monorepo subtree by Copybara. Edit it in the monorepo, never here.
+name: Sync back to the monorepo
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  request-import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ask the monorepo to import this PR
+        # pull_request_target runs in THIS repo's context, so the org secret HOP_SYNC_TOKEN is available
+        # even on a fork PR. It only dispatches the monorepo import; it never checks out the PR code.
+        env:
+          GH_TOKEN: ${{ secrets.HOP_SYNC_TOKEN }}
+        run: |
+          gh workflow run sync-components.yml \
+            --repo hopmesh/hop \
+            -f component="${{ github.event.repository.name }}" \
+            -f direction=import
