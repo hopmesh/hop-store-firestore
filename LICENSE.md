@@ -6,7 +6,7 @@ FSL-1.1-ALv2
 
 ## Notice
 
-Copyright 2026 Jason Waldrip
+Copyright 2026 Hop Mesh, LLC
 
 ## Terms and Conditions
 
