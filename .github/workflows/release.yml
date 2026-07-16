@@ -14,7 +14,7 @@ on:
 
 # OIDC trusted publishing: crates-io-auth-action trades the GitHub OIDC token for a short-lived crates.io
 # token, so there is no long-lived secret. Configure the Trusted Publisher on crates.io first (crate
-# hop-core, owner hopmesh, repo hop-core, workflow release.yml).
+# hop-mesh-store-firestore, owner hopmesh, repo hop-store-firestore, workflow release.yml).
 permissions:
   contents: read
   id-token: write

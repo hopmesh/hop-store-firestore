@@ -8,10 +8,10 @@ edition = "2021"
 repository = "https://github.com/hopmesh/hop"
 
 [workspace.dependencies]
-hop-core = "0.0.1"
-hop-endpoint-core = "0.0.1"
-hop-store-sqlite = { version = "0.0.1", default-features = false }
-hop-store-firestore = "0.0.1"
+hop-core = { version = "0.0.1", package = "hop-mesh-core" }
+hop-endpoint-core = { version = "0.0.1", package = "hop-mesh-endpoint-core" }
+hop-store-sqlite = { version = "0.0.1", default-features = false, package = "hop-mesh-store-sqlite" }
+hop-store-firestore = { version = "0.0.1", package = "hop-mesh-store-firestore" }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 blake3 = "1"
@@ -26,7 +26,7 @@ snow = "0.10"
 rusqlite = { version = "0.40", features = ["bundled"] }
 # --- end injected preamble ---
 [package]
-name = "hop-store-firestore"
+name = "hop-mesh-store-firestore"
 version.workspace = true
 edition.workspace = true
 license-file = "LICENSE.md"
