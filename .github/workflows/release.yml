@@ -1,0 +1,52 @@
+# release: publish the hop-store-firestore crate to crates.io on a semver tag.
+#
+# Inert in the monorepo (GitHub runs only root .github/workflows). Copybara mirrors core/stores/hop-store-firestore to its
+# own repo, injecting a standalone [workspace] preamble (see tools/copybara/copy.bara.sky), so Cargo.toml
+# resolves without the monorepo workspace and this becomes the repo-root release workflow.
+#
+# Firestore persistence behind the Store trait. Depends on hop-core, so hop-core must be on crates.io first.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+# OIDC trusted publishing: crates-io-auth-action trades the GitHub OIDC token for a short-lived crates.io
+# token, so there is no long-lived secret. Configure the Trusted Publisher on crates.io first (crate
+# hop-core, owner hopmesh, repo hop-core, workflow release.yml).
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Guard: the tag (minus its leading v) must equal the crate version, so a mistyped tag can never
+      # publish the wrong version. The version comes from the injected [workspace.package].
+      - name: Verify tag matches crate version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$tag" != "$ver" ]; then
+            echo "tag $tag does not match crate version $ver" >&2
+            exit 1
+          fi
+
+      - name: Authenticate to crates.io (OIDC trusted publishing)
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      # Token fallback (no trusted publisher): drop the auth step + id-token, set
+      # CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }} instead of the auth output.
+      - name: Publish to crates.io
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
