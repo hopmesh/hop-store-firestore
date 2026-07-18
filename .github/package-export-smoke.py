@@ -1197,6 +1197,7 @@ def validate_embedded(export, work, bundle, target):
         "native/native-artifacts.py",
         "native/native-artifacts.json",
         "native/native-artifacts.json.sig",
+        "native/native-artifacts.provenance.sigstore.json",
     }
     required_suffixes.update("native/artifacts/" + artifact["filename"] for artifact in selected)
     missing = {suffix for suffix in required_suffixes if not any(name.endswith(suffix) for name in names)}

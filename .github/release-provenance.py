@@ -196,15 +196,18 @@ def select_native_run(runs, source_sha):
         run
         for run in runs
         if run.get("display_title") == f"Native artifacts for {source_sha}"
+        and run.get("head_sha") == source_sha
         and run.get("head_branch") == "main"
-        and run.get("event") == "workflow_run"
+        and run.get("event") == "push"
         and run.get("path") == ".github/workflows/native-artifacts.yml"
     ]
-    if not matching:
-        raise ProvenanceError("canonical source has no native artifact run")
+    if len(matching) != 1:
+        raise ProvenanceError(
+            f"canonical source must have exactly one native artifact run, found {len(matching)}"
+        )
     if any(not isinstance(run.get("id"), int) or run["id"] < 1 for run in matching):
         raise ProvenanceError("canonical native artifact run ID is invalid")
-    run = max(matching, key=lambda item: item["id"])
+    run = matching[0]
     if run.get("status") != "completed" or run.get("conclusion") != "success":
         raise ProvenanceError("canonical native artifact run is not successful")
     if not isinstance(run.get("run_attempt"), int) or run["run_attempt"] < 1:
@@ -410,7 +413,7 @@ def verify(args):
         native_runs = github.paged(
             base + "/actions/workflows/native-artifacts.yml/runs",
             "workflow_runs",
-            {"branch": "main", "event": "workflow_run"},
+            {"branch": "main", "event": "push", "head_sha": source_sha},
         )
         native_run = select_native_run(native_runs, source_sha)
         native_run_id = str(native_run["id"])
