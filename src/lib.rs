@@ -3734,6 +3734,134 @@ impl Presence {
     }
 }
 
+/// A read-only view over every node partition's durable kv, for the §37 billing reconciler:
+/// it enumerates the node partitions under `relays/` and lists each one's kv pairs so the
+/// reconciler can collect the `usage/{hour}/{tenant}` and `telemetry_usage/{hour}/{tenant}`
+/// ledger rows the relays and telemetry collectors merge off their hot paths.
+///
+/// Pure reads (`documents.list`), satisfied by `roles/datastore.viewer`; wakes no node. The
+/// same auth scheme as every reader here: `FIRESTORE_ACCESS_TOKEN` env (local) or the
+/// metadata server (Cloud Run), via the shared cached token.
+pub struct KvReader {
+    http: reqwest::blocking::Client,
+    project: String,
+    /// The Firestore REST base, a field so tests can point it at a loopback responder.
+    base: String,
+    token: Mutex<Option<(String, Instant)>>,
+}
+
+impl KvReader {
+    pub fn new(project: &str) -> Self {
+        Self {
+            http: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .expect("http client"),
+            project: project.to_string(),
+            base: "https://firestore.googleapis.com/v1".to_string(),
+            token: Mutex::new(None),
+        }
+    }
+
+    fn token(&self) -> Result<String, String> {
+        cached_token(&self.token, &self.http)
+    }
+
+    /// Every node partition id (base58 address) under `relays/`. The parent docs are never
+    /// created (only their subcollections are written), so they are Firestore "missing" docs;
+    /// `showMissing=true` is what makes them enumerable. This sees EVERY partition that ever
+    /// wrote durable state, including scaled-to-zero relays and telemetry collectors, which is
+    /// exactly what billing needs (a partition with unreconciled rows must never be skipped
+    /// just because its node is asleep).
+    pub fn list_nodes(&self) -> Result<Vec<String>, String> {
+        let collection_url = format!(
+            "{}/projects/{}/databases/(default)/documents/relays",
+            self.base, self.project
+        );
+        let token = self.token()?;
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut url = format!("{collection_url}?showMissing=true&pageSize=300");
+            if let Some(t) = &page_token {
+                url.push_str(&format!("&pageToken={t}"));
+            }
+            let resp = self
+                .http
+                .get(&url)
+                .bearer_auth(&token)
+                .send()
+                .map_err(|e| e.to_string())?;
+            if resp.status().as_u16() == 404 {
+                return Ok(out);
+            }
+            if !resp.status().is_success() {
+                return Err(format!("list_nodes {}", resp.status()));
+            }
+            let v: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+            if let Some(docs) = v["documents"].as_array() {
+                for d in docs {
+                    // A missing doc carries only `name`; the partition id is its last segment.
+                    if let Some(id) = d["name"].as_str().and_then(|n| n.rsplit('/').next()) {
+                        if !id.is_empty() {
+                            out.push(id.to_string());
+                        }
+                    }
+                }
+            }
+            match v["nextPageToken"].as_str() {
+                Some(t) if !t.is_empty() => page_token = Some(t.to_string()),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// All kv pairs in `node`'s (base58) partition, `(original key, raw value bytes)`. The key
+    /// comes from the doc's `key` field (doc ids are base58'd because kv keys contain `/`);
+    /// callers filter by prefix client-side (there is no server-side prefix query here).
+    pub fn list_kv_of(&self, node: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let collection_url = format!(
+            "{}/projects/{}/databases/(default)/documents/relays/{node}/kv",
+            self.base, self.project
+        );
+        let token = self.token()?;
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut url = format!("{collection_url}?pageSize=300");
+            if let Some(t) = &page_token {
+                url.push_str(&format!("&pageToken={t}"));
+            }
+            let resp = self
+                .http
+                .get(&url)
+                .bearer_auth(&token)
+                .send()
+                .map_err(|e| e.to_string())?;
+            if resp.status().as_u16() == 404 {
+                return Ok(out);
+            }
+            if !resp.status().is_success() {
+                return Err(format!("list_kv_of {}", resp.status()));
+            }
+            let v: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+            if let Some(docs) = v["documents"].as_array() {
+                for d in docs {
+                    if let Some(pair) = parse_kv_doc(d) {
+                        out.push(pair);
+                    }
+                }
+            }
+            match v["nextPageToken"].as_str() {
+                Some(t) if !t.is_empty() => page_token = Some(t.to_string()),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// Build a Firestore document body for a device presence record.
 /// How long after its last heartbeat a presence/registry doc is allowed to persist before the
 /// Firestore TTL sweeps it (F-20). A small multiple of the ~90s read-side staleness filter: the read
@@ -6637,6 +6765,73 @@ mod tests {
             presence_url: format!("{base}/documents/presence"),
             token: seeded_token(),
         }
+    }
+
+    fn kv_reader_at(base: &str) -> KvReader {
+        KvReader {
+            http: test_http(),
+            project: "proj".to_string(),
+            base: base.to_string(),
+            token: seeded_token(),
+        }
+    }
+
+    #[test]
+    fn kv_reader_lists_nodes_with_show_missing_and_paginates() {
+        // Two pages; the docs are "missing" parents so they carry only `name`. The reader must
+        // request showMissing (parents are never created directly) and follow nextPageToken.
+        let page1 = serde_json::json!({
+            "documents": [
+                { "name": "projects/proj/databases/(default)/documents/relays/NodeA" },
+                { "name": "projects/proj/databases/(default)/documents/relays/NodeB" },
+            ],
+            "nextPageToken": "tok1",
+        });
+        let page2 = serde_json::json!({
+            "documents": [
+                { "name": "projects/proj/databases/(default)/documents/relays/NodeC" },
+            ],
+        });
+        let srv = spawn_mock(vec![(200, page1.to_string()), (200, page2.to_string())]);
+        let reader = kv_reader_at(&srv.base);
+        let nodes = reader.list_nodes().unwrap();
+        assert_eq!(nodes, vec!["NodeA", "NodeB", "NodeC"]);
+        let reqs = srv.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0]
+            .target
+            .contains("/documents/relays?showMissing=true"));
+        assert!(reqs[1].target.contains("pageToken=tok1"));
+    }
+
+    #[test]
+    fn kv_reader_list_nodes_treats_404_as_empty() {
+        let srv = spawn_mock(vec![(404, "{}".into())]);
+        assert!(kv_reader_at(&srv.base).list_nodes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn kv_reader_lists_kv_pairs_recovering_the_original_key() {
+        // kv docs carry the ORIGINAL key in a `key` field (doc ids are base58'd because keys
+        // contain '/'); the reader must return that, plus the raw value bytes.
+        let doc = kv_doc_json(
+            "usage/402/00000000000000000000000000000000",
+            &7u64.to_le_bytes(),
+        );
+        let page = serde_json::json!({ "documents": [doc] });
+        let srv = spawn_mock(vec![(200, page.to_string())]);
+        let pairs = kv_reader_at(&srv.base).list_kv_of("NodeA").unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "usage/402/00000000000000000000000000000000");
+        assert_eq!(pairs[0].1, 7u64.to_le_bytes().to_vec());
+        let reqs = srv.requests.lock().unwrap();
+        assert!(reqs[0].target.contains("/documents/relays/NodeA/kv"));
+    }
+
+    #[test]
+    fn kv_reader_list_kv_surfaces_server_errors() {
+        let srv = spawn_mock(vec![(500, "{}".into())]);
+        assert!(kv_reader_at(&srv.base).list_kv_of("NodeA").is_err());
     }
 
     #[test]
