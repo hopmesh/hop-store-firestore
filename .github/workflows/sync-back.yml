@@ -26,13 +26,13 @@ jobs:
           app-id: ${{ secrets.HOP_SYNC_APP_ID }}
           private-key: ${{ secrets.HOP_SYNC_APP_PRIVATE_KEY }}
           owner: hopmesh
-          repositories: hop
+          repositories: monorepo
           permission-actions: write
       - name: Ask the monorepo to import this PR
         env:
           GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
         run: |
           gh workflow run sync-components.yml \
-            --repo hopmesh/hop \
+            --repo hopmesh/monorepo \
             -f component=hop-store-firestore \
             -f direction=import

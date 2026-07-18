@@ -433,7 +433,7 @@ def verify(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--component", required=True)
-    parser.add_argument("--source-repository", default="hopmesh/hop")
+    parser.add_argument("--source-repository", default="hopmesh/monorepo")
     parser.add_argument("--repository", default=".")
     parser.add_argument("--require-native-artifacts", action="store_true")
     parser.add_argument("--github-output")

@@ -63,7 +63,7 @@ jobs:
           app-id: ${{ secrets.HOP_SOURCE_APP_ID }}
           private-key: ${{ secrets.HOP_SOURCE_APP_PRIVATE_KEY }}
           owner: hopmesh
-          repositories: hop
+          repositories: monorepo
           permission-actions: read
           permission-checks: read
           permission-contents: read
