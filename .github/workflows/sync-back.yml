@@ -11,17 +11,28 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened]
 
+permissions: {}
+
 jobs:
   request-import:
+    environment:
+      name: component-sync
     runs-on: ubuntu-latest
     steps:
+      - name: Mint canonical-repository dispatch token
+        id: dispatch-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.HOP_SYNC_APP_ID }}
+          private-key: ${{ secrets.HOP_SYNC_APP_PRIVATE_KEY }}
+          owner: hopmesh
+          repositories: hop
+          permission-actions: write
       - name: Ask the monorepo to import this PR
-        # pull_request_target runs in THIS repo's context, so the org secret HOP_SYNC_TOKEN is available
-        # even on a fork PR. It only dispatches the monorepo import; it never checks out the PR code.
         env:
-          GH_TOKEN: ${{ secrets.HOP_SYNC_TOKEN }}
+          GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
         run: |
           gh workflow run sync-components.yml \
             --repo hopmesh/hop \
-            -f component="${{ github.event.repository.name }}" \
+            -f component=hop-store-firestore \
             -f direction=import

@@ -1,0 +1,23 @@
+{
+  "hop-sdk-node": {"prefix": "sdk/node"},
+  "hop-sdk-python": {"prefix": "sdk/python"},
+  "hop-sdk-go": {"prefix": "sdk/go"},
+  "hop-sdk-ruby": {"prefix": "sdk/ruby"},
+  "hop-sdk-crystal": {"prefix": "sdk/crystal"},
+  "hop-sdk-elixir": {"prefix": "sdk/elixir"},
+  "hop-sdk-apple": {"prefix": "sdk/apple"},
+  "hop-sdk-android": {"prefix": "sdk/android"},
+  "hop-embedded": {"prefix": "sdk/embedded"},
+  "hop-core": {"prefix": "core/hop-core", "rust": true, "rename": ["hop-core", "hop-mesh-core"]},
+  "libhop": {"prefix": "core/hop", "rust": true, "rename": ["hop", "libhop"]},
+  "hop-wasm": {"prefix": "core/hop-wasm", "rust": true},
+  "hop-store-sqlite": {"prefix": "core/stores/hop-store-sqlite", "rust": true, "rename": ["hop-store-sqlite", "hop-mesh-store-sqlite"]},
+  "hop-store-firestore": {"prefix": "core/stores/hop-store-firestore", "rust": true, "rename": ["hop-store-firestore", "hop-mesh-store-firestore"]},
+  "hop-bearers-apple": {"prefix": "bearers/apple"},
+  "hop-bearers-android": {"prefix": "bearers/android"},
+  "hop-driver-apple": {"prefix": "drivers/apple/HopDriver"},
+  "hop-driver-android": {"prefix": "drivers/android/hop-driver"},
+  "hop-relayd": {"prefix": "services/hop-relayd", "rust": true},
+  "hop-endpoint": {"prefix": "services/hop-endpoint", "rust": true},
+  "hop-gateway": {"prefix": "services/hop-gateway", "rust": true}
+}
