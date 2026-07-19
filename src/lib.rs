@@ -3373,6 +3373,165 @@ fn parse_registry_doc(d: &serde_json::Value) -> Option<PeerInfo> {
 }
 
 // ---------------------------------------------------------------------------
+// Tenant registry (§35): the account service WRITES it, the fleet READS it.
+// ---------------------------------------------------------------------------
+
+/// One tenant's fleet-facing record, projected from the account service's Postgres registry into
+/// Firestore so relays and collectors can authorize carriage stamps and route telemetry without a
+/// static operator file. Keyed by `tenant_hex` (32 lowercase-hex chars = a 16-byte TenantId).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TenantRecord {
+    pub tenant_hex: String,
+    /// The tenant's Ed25519 carriage-stamp PUBLIC key (64 lowercase-hex), or `None` before issuance.
+    pub carriage_pubkey: Option<String>,
+    /// The tenant's managed-OTLP forward endpoint, or `None`.
+    pub otlp_endpoint: Option<String>,
+    /// Whether the tenant is currently entitled. A suspended/closed tenant syncs as `active=false` so
+    /// the fleet can drop it without the account service having to delete the row.
+    pub active: bool,
+}
+
+/// The tenant registry the fleet reads and the account service writes: a top-level `tenants`
+/// collection, one document per `tenant_hex`. Same workload-identity token path as the presence
+/// [`Registry`]. Reads and writes are plain Firestore REST; a read wakes no node.
+pub struct TenantRegistry {
+    http: reqwest::blocking::Client,
+    collection_url: String, // .../documents/tenants
+    token: Mutex<Option<(String, Instant)>>,
+}
+
+impl TenantRegistry {
+    pub fn new(project: &str) -> Self {
+        let base = "https://firestore.googleapis.com/v1";
+        let collection_url =
+            format!("{base}/projects/{project}/databases/(default)/documents/tenants");
+        Self {
+            http: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .expect("http client"),
+            collection_url,
+            token: Mutex::new(None),
+        }
+    }
+
+    fn token(&self) -> Result<String, String> {
+        cached_token(&self.token, &self.http)
+    }
+
+    /// Upsert one tenant's record (idempotent PATCH). Called by the account service on projection.
+    /// `tenant_hex` must be validated (32 lowercase-hex) by the caller; it is refused here as a guard
+    /// so a malformed id can never smuggle a path segment into the Firestore URL.
+    pub fn upsert(&self, r: &TenantRecord) -> Result<(), String> {
+        if !is_tenant_hex(&r.tenant_hex) {
+            return Err("invalid tenant_hex".into());
+        }
+        let url = format!("{}/{}", self.collection_url, r.tenant_hex);
+        let token = self.token()?;
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(token)
+            .json(&tenant_doc_json(r))
+            .send()
+            .map_err(|e| e.to_string())?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("tenant upsert {}", resp.status()))
+        }
+    }
+
+    /// Every tenant record (the fleet builds its KeyServer / OTLP map from this). Malformed documents
+    /// are skipped rather than failing the whole read, so one odd row can't blank the fleet's view.
+    pub fn all(&self) -> Result<Vec<TenantRecord>, String> {
+        let token = self.token()?;
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut req = self
+                .http
+                .get(&self.collection_url)
+                .query(&[("pageSize", "300")])
+                .bearer_auth(&token);
+            if let Some(pt) = &page_token {
+                req = req.query(&[("pageToken", pt.as_str())]);
+            }
+            let resp = req.send().map_err(|e| e.to_string())?;
+            if resp.status().as_u16() == 404 {
+                return Ok(out); // no registry yet
+            }
+            if !resp.status().is_success() {
+                return Err(format!("tenants list {}", resp.status()));
+            }
+            let v: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+            if let Some(docs) = v["documents"].as_array() {
+                out.extend(docs.iter().filter_map(parse_tenant_doc));
+            }
+            match v["nextPageToken"].as_str() {
+                Some(pt) if !pt.is_empty() => page_token = Some(pt.to_string()),
+                _ => return Ok(out),
+            }
+        }
+    }
+}
+
+/// A `tenant_hex` is exactly 32 lowercase-hex chars (a 16-byte TenantId).
+fn is_tenant_hex(s: &str) -> bool {
+    s.len() == 32
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Build a Firestore document body for a tenant record. Optional fields are omitted when `None` (a
+/// missing field parses back to `None`), so an unissued key is never a bogus empty string.
+fn tenant_doc_json(r: &TenantRecord) -> serde_json::Value {
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "tenant".into(),
+        serde_json::json!({ "stringValue": r.tenant_hex }),
+    );
+    fields.insert(
+        "active".into(),
+        serde_json::json!({ "booleanValue": r.active }),
+    );
+    if let Some(pk) = &r.carriage_pubkey {
+        fields.insert(
+            "carriagePubkey".into(),
+            serde_json::json!({ "stringValue": pk }),
+        );
+    }
+    if let Some(ep) = &r.otlp_endpoint {
+        fields.insert(
+            "otlpEndpoint".into(),
+            serde_json::json!({ "stringValue": ep }),
+        );
+    }
+    serde_json::json!({ "fields": fields })
+}
+
+/// Parse a Firestore tenant document into a [`TenantRecord`]. Requires a valid `tenant` field;
+/// returns `None` for anything malformed so [`TenantRegistry::all`] can skip it.
+fn parse_tenant_doc(d: &serde_json::Value) -> Option<TenantRecord> {
+    let f = d.get("fields")?;
+    let tenant_hex = f["tenant"]["stringValue"].as_str()?.to_string();
+    if !is_tenant_hex(&tenant_hex) {
+        return None;
+    }
+    Some(TenantRecord {
+        tenant_hex,
+        carriage_pubkey: f["carriagePubkey"]["stringValue"]
+            .as_str()
+            .map(str::to_string),
+        otlp_endpoint: f["otlpEndpoint"]["stringValue"]
+            .as_str()
+            .map(str::to_string),
+        // Absent `active` (an older/partial doc) is treated as inactive: fail closed.
+        active: f["active"]["booleanValue"].as_bool().unwrap_or(false),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Cross-partition handoff (DESIGN.md §28): the offline-destination mailbox.
 // ---------------------------------------------------------------------------
 
@@ -5726,6 +5885,50 @@ mod tests {
     #[test]
     fn parse_registry_doc_rejects_garbage() {
         assert!(parse_registry_doc(&serde_json::json!({"name": "x"})).is_none());
+    }
+
+    #[test]
+    fn tenant_doc_round_trips_with_and_without_optional_fields() {
+        let full = TenantRecord {
+            tenant_hex: "a3f1c0d2e4b6a8091122334455667788".into(),
+            carriage_pubkey: Some(
+                "aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44".into(),
+            ),
+            otlp_endpoint: Some("https://otlp.datadoghq.com/v1".into()),
+            active: true,
+        };
+        let doc = serde_json::json!({ "name": "x", "fields": tenant_doc_json(&full)["fields"] });
+        assert_eq!(parse_tenant_doc(&doc).unwrap(), full);
+
+        // Unissued key / no OTLP: those fields are omitted and parse back to None.
+        let bare = TenantRecord {
+            tenant_hex: "00112233445566778899aabbccddeeff".into(),
+            carriage_pubkey: None,
+            otlp_endpoint: None,
+            active: false,
+        };
+        let doc = serde_json::json!({ "name": "x", "fields": tenant_doc_json(&bare)["fields"] });
+        assert_eq!(parse_tenant_doc(&doc).unwrap(), bare);
+    }
+
+    #[test]
+    fn parse_tenant_doc_rejects_garbage_and_bad_hex() {
+        assert!(parse_tenant_doc(&serde_json::json!({"name": "x"})).is_none());
+        // a non-hex / wrong-length tenant id is refused
+        let bad = serde_json::json!({ "fields": { "tenant": { "stringValue": "not-a-tenant" }, "active": { "booleanValue": true } } });
+        assert!(parse_tenant_doc(&bad).is_none());
+    }
+
+    #[test]
+    fn tenant_upsert_refuses_a_malformed_id_before_any_request() {
+        let reg = TenantRegistry::new("proj");
+        let r = TenantRecord {
+            tenant_hex: "../secrets".into(),
+            carriage_pubkey: None,
+            otlp_endpoint: None,
+            active: true,
+        };
+        assert!(reg.upsert(&r).is_err());
     }
 
     #[test]
