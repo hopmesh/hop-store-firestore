@@ -3476,11 +3476,38 @@ impl TenantRegistry {
     }
 }
 
+impl TenantRecord {
+    /// The `(TenantId, carriage pubkey)` this record authorizes for keyed admission / attribution, or
+    /// `None` if the tenant is inactive, has no issued key, or carries a malformed hex id/key. Both
+    /// relays and collectors build their `KeyServer` from this, so the active/keyed/well-formed rule
+    /// lives in exactly one place. The 16-byte TenantId and 32-byte Ed25519 pubkey are returned as
+    /// plain arrays (matching `hop_core::TenantId` / `PubKeyBytes`).
+    pub fn carriage_key(&self) -> Option<([u8; 16], [u8; 32])> {
+        if !self.active {
+            return None;
+        }
+        let pubkey = self.carriage_pubkey.as_deref()?;
+        Some((hex_array::<16>(&self.tenant_hex)?, hex_array::<32>(pubkey)?))
+    }
+}
+
 /// A `tenant_hex` is exactly 32 lowercase-hex chars (a 16-byte TenantId).
 fn is_tenant_hex(s: &str) -> bool {
     s.len() == 32
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Decode exactly `N*2` hex chars into `[u8; N]`; `None` on wrong length or a non-hex char.
+fn hex_array<const N: usize>(s: &str) -> Option<[u8; N]> {
+    if s.len() != N * 2 || !s.is_ascii() {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Build a Firestore document body for a tenant record. Optional fields are omitted when `None` (a
@@ -5929,6 +5956,29 @@ mod tests {
             active: true,
         };
         assert!(reg.upsert(&r).is_err());
+    }
+
+    #[test]
+    fn carriage_key_admits_only_active_keyed_wellformed_records() {
+        let t = "00112233445566778899aabbccddeeff";
+        let pk = "aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44";
+        let rec = |active, key: Option<&str>, tenant: &str| TenantRecord {
+            tenant_hex: tenant.into(),
+            carriage_pubkey: key.map(str::to_string),
+            otlp_endpoint: None,
+            active,
+        };
+        // active + issued key + valid hex -> (16-byte tenant, 32-byte pubkey)
+        let (tid, pubkey) = rec(true, Some(pk), t).carriage_key().unwrap();
+        assert_eq!(tid.len(), 16);
+        assert_eq!(pubkey.len(), 32);
+        assert_eq!(tid[0], 0x00);
+        assert_eq!(pubkey[0], 0xaa);
+        // inactive / unissued / malformed -> None (never authorize)
+        assert!(rec(false, Some(pk), t).carriage_key().is_none());
+        assert!(rec(true, None, t).carriage_key().is_none());
+        assert!(rec(true, Some("dead"), t).carriage_key().is_none());
+        assert!(rec(true, Some(pk), "short").carriage_key().is_none());
     }
 
     #[test]
