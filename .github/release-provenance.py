@@ -81,23 +81,13 @@ def validate_tag_state(
 
 
 def parse_required_checks(path):
-    checks = []
-    in_variable = False
-    in_default = False
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        if re.match(r'^variable\s+"github_required_checks"\s*\{\s*$', line):
-            in_variable = True
-            continue
-        if in_variable and re.match(r"^\s*default\s*=\s*\[\s*$", line):
-            in_default = True
-            continue
-        if not in_default:
-            continue
-        if re.match(r"^\s*\]\s*$", line):
-            break
-        match = re.match(r'^\s*"(.*)",\s*$', line)
-        if match:
-            checks.append(match.group(1))
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ProvenanceError(f"canonical required-check list is unreadable: {error}")
+    checks = data.get("required_checks") if isinstance(data, dict) else None
+    if not isinstance(checks, list) or not all(isinstance(name, str) and name for name in checks):
+        raise ProvenanceError("canonical required-check list is absent or malformed")
     if not checks:
         raise ProvenanceError("canonical required-check list is absent")
     duplicates = sorted({name for name in checks if checks.count(name) > 1})
@@ -398,7 +388,7 @@ def verify(args):
         expected = expected_export_tree(source_root, args.component, components)
         actual = git_tree(repo, tag_commit)
         compare_trees(expected, actual)
-        required = parse_required_checks(source_root / "infra/bootstrap/variables.tf")
+        required = parse_required_checks(source_root / "tools/required-checks.json")
 
     runs_payload = github.request_json(
         base + "/actions/workflows/ci.yml/runs",
