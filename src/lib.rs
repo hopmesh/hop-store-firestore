@@ -30,7 +30,7 @@
 //!
 //! Durable cleanup of expired bundles is left to a **Firestore TTL policy** on the
 //! `expireAt` timestamp field (a one-time setup; TTL only sweeps `timestampValue`
-//! fields, so every doc carries one — see `doc_json`), keeping `prune` a fast
+//! fields, so every doc carries one; see `doc_json`), keeping `prune` a fast
 //! in-memory op. One policy on the `bundles` collection group covers both the
 //! per-relay handoff inbox and the §39 mailbox spool.
 //!
@@ -2103,7 +2103,7 @@ impl FirestoreClient {
             .bearer_auth(token)
             .send()
             .map_err(|e| e.to_string())?;
-        // 404 is fine — already gone.
+        // 404 is fine, already gone.
         if resp.status().is_success() || resp.status().as_u16() == 404 {
             Ok(())
         } else {
@@ -3202,7 +3202,7 @@ fn fetch_gcp_token(http: &reqwest::blocking::Client) -> Result<String, String> {
     }
     // Ask the metadata server for a token scoped to Firestore. Without an explicit `scopes`,
     // the runtime SA token was rejected by Firestore with 401 (the presence/§28 backbone never
-    // authenticated — failing silently since deploy). The SA has roles/datastore.user; this just
+    // authenticated, failing silently since deploy). The SA has roles/datastore.user; this just
     // mints a token carrying the matching OAuth scope. `cloud-platform` covers every API the relay
     // touches (all of which are Firestore today) so we don't have to enumerate per-API scopes.
     let url = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform";
@@ -3256,7 +3256,7 @@ fn is_fresh(heartbeat_ms: u64, now_ms: u64, ttl_ms: u64) -> bool {
 /// The passive liveness registry. Online relays heartbeat a doc keyed by their node
 /// id into a top-level `registry` collection; readers filter by freshness. **Reading
 /// never wakes a node** (it's a Firestore read), so a node is only ever woken by its
-/// own clients — never by a peer (DESIGN.md §28).
+/// own clients, never by a peer (DESIGN.md §28).
 pub struct Registry {
     http: reqwest::blocking::Client,
     collection_url: String, // .../documents/registry
@@ -3305,7 +3305,7 @@ impl Registry {
     }
 
     /// Currently-online peers (fresh heartbeat within `ttl_ms`), excluding ourselves.
-    /// A pure Firestore read — wakes no one.
+    /// A pure Firestore read, wakes no one.
     pub fn online(&self, now_ms: u64, ttl_ms: u64) -> Result<Vec<PeerInfo>, String> {
         let token = self.token()?;
         let resp = self
@@ -3576,11 +3576,11 @@ pub struct DevicePresence {
 /// When a relay holds a `Device`-addressed bundle it can't deliver locally, it looks
 /// up where that device was last seen (`region_of`) and writes the bundle into *that
 /// region's own partition* (`put_bundle_to`, deriving the region's node address the
-/// same way every node does — shared seed + region name). The destination region then
+/// same way every node does, shared seed + region name). The destination region then
 /// delivers it on its next cold-start / device check-in by rehydrating its partition.
 ///
 /// Presence is a passive Firestore write/read: looking up a device's region **wakes no
-/// node** — only the destination region's own clients ever wake it (DESIGN.md §28).
+/// node**, only the destination region's own clients ever wake it (DESIGN.md §28).
 pub struct Presence {
     http: reqwest::blocking::Client,
     project: String,
@@ -3633,7 +3633,7 @@ impl Presence {
     }
 
     /// Where was `device` (base58) last seen, if its check-in is still fresh within
-    /// `ttl_ms`? A pure read — wakes no node. `Ok(None)` means unknown or stale.
+    /// `ttl_ms`? A pure read, wakes no node. `Ok(None)` means unknown or stale.
     pub fn region_of(
         &self,
         device: &str,
@@ -3722,7 +3722,7 @@ impl Presence {
         self.visit_bundle_collection(&collection_url, reserve, visit)
     }
 
-    /// Write a bundle into `node`'s (base58) partition — used to hand a bundle off into
+    /// Write a bundle into `node`'s (base58) partition, used to hand a bundle off into
     /// the destination region's mailbox. The owning node ingests it on its next
     /// partition reload (warm) or cold-start rehydrate.
     pub fn put_bundle_to(
@@ -3755,11 +3755,11 @@ impl Presence {
     }
 
     /// §39 P5 blind spool: durably hold a PRIVATE bundle keyed by its **mailbox-tag** (base58 of the
-    /// 16-byte tag) — a rotatable pseudonym, NOT an address — so an offline recipient can pull it on
+    /// 16-byte tag), a rotatable pseudonym, NOT an address, so an offline recipient can pull it on
     /// return. A separate collection from the device-address inbox (`relays/{node}`); the relay never
     /// opens the sealed envelope. The recipient is unlinkable here except by the mailbox-tag while it
     /// lives (the §39 cost of being pull-reachable offline). Swept at its own §8 lifetime by the
-    /// `expireAt` TTL policy on the `bundles` collection group (zero compute) — same policy that
+    /// `expireAt` TTL policy on the `bundles` collection group (zero compute), same policy that
     /// reaps the handoff inbox, since both collections share the `bundles` id.
     pub fn spool_to_mailbox(
         &self,
@@ -3897,7 +3897,7 @@ impl Presence {
     }
 
     /// §39 P5: drop one spooled bundle after it's been pulled (the recipient is now reachable, so
-    /// P4's live gradient delivers it). Idempotent — a 404 (already gone / TTL-swept) is fine.
+    /// P4's live gradient delivers it). Idempotent, a 404 (already gone / TTL-swept) is fine.
     pub fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String> {
         let base = &self.base;
         let doc = bs58::encode(id).into_string();
@@ -4051,7 +4051,7 @@ impl KvReader {
 /// Build a Firestore document body for a device presence record.
 /// How long after its last heartbeat a presence/registry doc is allowed to persist before the
 /// Firestore TTL sweeps it (F-20). A small multiple of the ~90s read-side staleness filter: the read
-/// path already ignores anything this old, so deletion cannot regress routing — it only stops the
+/// path already ignores anything this old, so deletion cannot regress routing; it only stops the
 /// collection being an indefinitely-retained per-address→region location log (DESIGN §33).
 const PRESENCE_DOC_TTL_MS: u64 = 3_600_000; // 1h
 
@@ -4086,9 +4086,9 @@ fn doc_json(data: &[u8], expires_at: u64) -> serde_json::Value {
     serde_json::json!({
         "fields": {
             "data": { "bytesValue": b64 },
-            // Integer epoch-millis — what `parse_doc` reads back.
+            // Integer epoch-millis, what `parse_doc` reads back.
             "expiresAt": { "integerValue": expires_at.to_string() },
-            // RFC3339 timestamp — the field the ACTIVE Firestore TTL policy sweeps on. TTL acts
+            // RFC3339 timestamp, the field the ACTIVE Firestore TTL policy sweeps on. TTL acts
             // ONLY on a `timestampValue` field (an integer is silently ignored), so this is what
             // actually garbage-collects expired handoff/spool bundles at their §8 lifetime.
             "expireAt": { "timestampValue": rfc3339_utc(expires_at) },
@@ -4096,7 +4096,7 @@ fn doc_json(data: &[u8], expires_at: u64) -> serde_json::Value {
     })
 }
 
-/// Format epoch-milliseconds as an RFC3339 UTC timestamp (e.g. `"2001-09-09T01:46:40Z"`) — the
+/// Format epoch-milliseconds as an RFC3339 UTC timestamp (e.g. `"2001-09-09T01:46:40Z"`), the
 /// shape Firestore stores as a `timestampValue`, the only field type its TTL feature acts on.
 /// Pure integer math (no date crate): civil-from-days per Howard Hinnant's `chrono` algorithm.
 fn rfc3339_utc(epoch_ms: u64) -> String {
@@ -4979,7 +4979,7 @@ mod tests {
         // sentinel and did put_with_expiry(_, 0). But MemoryStore::prune drops any id with
         // `exp <= now_ms`, and `0 <= now_ms` is ALWAYS true, so that bundle was wiped on the FIRST
         // real-clock prune (~1s after cold start): the sentinel was false. The contract is now
-        // honest — a 0 (or any past) expiry is treated as already-expired and NOT resurrected, so
+        // honest, a 0 (or any past) expiry is treated as already-expired and NOT resurrected, so
         // there is no phantom bundle that appears rehydrated only to vanish on the next prune.
         let zero = sample(4);
         let zero_id = zero.id();
@@ -5873,7 +5873,7 @@ mod tests {
     #[test]
     fn doc_carries_a_timestamp_for_ttl() {
         // The TTL policy is on `expireAt` and only acts on a `timestampValue`, so every doc
-        // must carry one (an integer-only doc would never be swept — the bug this guards).
+        // must carry one (an integer-only doc would never be swept, the bug this guards).
         let json = doc_json(b"x", 1_000_000_000_000); // 2001-09-09T01:46:40Z
         assert_eq!(
             json["fields"]["expireAt"]["timestampValue"],
