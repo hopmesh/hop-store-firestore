@@ -11,12 +11,17 @@ git-cliff. Do not edit by hand.
 - bump create-github-app-token to v3.2.0 across all mirrored components (efc9f6c)
 
 ### Chore
+- purge em-dashes and en-dashes from source (d222435)
 - drop the root license, license per-component (FSL-1.1-ALv2) (#146) (be2a5a7)
 
 ### Documentation
 - branded, marketable READMEs for every sub-repo (9c2a477)
 
 ### Features
+- finish inbound (import), drop export_pr (41c095e)
+- relays + collectors read tenant keys from the registry (5b-2, reader) (f80f5b3)
+- project the tenant registry to Firestore (phase 5b, writer) (e73d8d9)
+- auto-generate monorepo + per-library changelogs (git-cliff) (8c64c37)
 - the ledger source, closing the reconcile chain end to end (ba6b6b8)
 
 ### Other
