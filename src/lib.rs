@@ -5285,6 +5285,8 @@ mod tests {
             AdvertKind::PreKey {
                 spk_pub: recipient_prekey.public,
                 spk_sig: recipient_prekey.sig.to_vec(),
+                opks: Vec::new(),
+                opk_sig: Vec::new(),
             },
             1,
             60_000,
@@ -5418,6 +5420,8 @@ mod tests {
             AdvertKind::PreKey {
                 spk_pub: recipient_prekey.public,
                 spk_sig: recipient_prekey.sig.to_vec(),
+                opks: Vec::new(),
+                opk_sig: Vec::new(),
             },
             now_ms,
             60_000,
@@ -5452,6 +5456,8 @@ mod tests {
             AdvertKind::PreKey {
                 spk_pub: recipient_prekey.public,
                 spk_sig: recipient_prekey.sig.to_vec(),
+                opks: Vec::new(),
+                opk_sig: Vec::new(),
             },
             now_ms.saturating_add(1),
             60_000,
