@@ -35,4 +35,5 @@ jobs:
           gh workflow run sync-components.yml \
             --repo hopmesh/monorepo \
             -f component=hop-store-firestore \
-            -f direction=import
+            -f direction=import \
+            -f pr_number=${{ github.event.pull_request.number }}
