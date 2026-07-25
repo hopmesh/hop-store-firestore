@@ -593,7 +593,7 @@ impl FirestoreStore {
     }
 
     /// stores-r2-01: re-mirror an already-held bundle (after a spray-and-wait split or a retransmit
-    /// set_copies) reusing the RECEIVER-anchored `expires_at` this store recorded at `put` time,
+    /// handoff) reusing the RECEIVER-anchored `expires_at` this store recorded at `put` time,
     /// NOT `created_at + lifetime_ms`. `created_at` is the SENDER's advisory clock (§8, defaults to
     /// 0): re-deriving from it can rewrite the durable doc's `expireAt` into the past (created_at=0
     /// -> ~1970), so the Firestore TTL policy would sweep a still-live spooled/handoff bundle early
@@ -620,20 +620,6 @@ impl FirestoreStore {
                 ))
             }
         }
-    }
-
-    fn remirror(&self, id: &BundleId, bundle: &Bundle) -> std::result::Result<(), String> {
-        let Some(expires_at) = self.inner.seen_expiry(id) else {
-            return Err("bundle is no longer tracked for durable remirror".into());
-        };
-        let data = bundle.to_bytes().map_err(|e| e.to_string())?;
-        self.commit_op(|ack| Op::Write {
-            id: *id,
-            data,
-            expires_at,
-            ack,
-        })
-        .map_err(|error| error.to_string())
     }
 
     fn drain_for_recovery(&self, timeout: Duration) -> bool {
@@ -1138,29 +1124,6 @@ impl Store for FirestoreStore {
         // In-memory only; the durable copies are reaped by a Firestore TTL policy on
         // the `expireAt` timestamp (one-time setup), keeping prune off the network.
         self.inner.prune(now_ms);
-    }
-
-    fn split_copies(&mut self, id: &BundleId) -> u16 {
-        let Some(mut candidate) = self.inner.get(id) else {
-            return 0;
-        };
-        let give = candidate.split_copies();
-        if give > 0 && self.remirror(id, &candidate).is_ok() {
-            self.inner.set_copies(id, candidate.env.copies);
-            give
-        } else {
-            0
-        }
-    }
-
-    fn set_copies(&mut self, id: &BundleId, copies: u16) {
-        let Some(mut candidate) = self.inner.get(id) else {
-            return;
-        };
-        candidate.env.copies = copies;
-        if self.remirror(id, &candidate).is_ok() {
-            self.inner.set_copies(id, copies);
-        }
     }
 
     fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
@@ -5615,86 +5578,6 @@ mod tests {
     }
 
     #[test]
-    fn split_copies_remirror_uses_receiver_anchored_expiry_not_created_at() {
-        // stores-r2-01: a spray-and-wait split (or retransmit set_copies) on a RELAYED bundle whose
-        // sender stamped created_at=0 (advisory, defaults to 0) must NOT re-anchor the durable doc's
-        // expiry at created_at+lifetime (which lands ~1970 -> the Firestore TTL sweeps a still-live
-        // spooled/handoff bundle early, silently dropping an offline recipient's message). The
-        // re-mirror must reuse the receiver-anchored expiry recorded at put() time.
-        let mirror = FakeMirror::default();
-        let ops = mirror.ops.clone();
-        let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
-
-        let lifetime_ms: u32 = 3_600_000; // 1h
-        let now_ms: u64 = 10_000_000_000; // a real epoch-ms (well past 1970)
-        let b = sample_with(4, /*created_at=*/ 0, lifetime_ms);
-        let id = b.id();
-        assert!(store.put(b, now_ms));
-
-        // Force a spray-and-wait split, which re-mirrors the (now decremented) bundle.
-        let gave = store.split_copies(&id);
-        assert!(gave > 0, "split handed out at least one copy");
-        assert!(store.flush(std::time::Duration::from_secs(5)));
-
-        let recorded = ops.lock().unwrap().clone();
-        // Two puts recorded for this id: the initial put and the split re-mirror. BOTH must carry the
-        // receiver-anchored expiry (now + lifetime), never created_at(0) + lifetime.
-        let put_expiries: Vec<u64> = recorded
-            .iter()
-            .filter_map(|op| match op {
-                MirrorOp::Put { id: i, expires_at } if *i == id => Some(*expires_at),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(put_expiries.len(), 2, "initial put + split re-mirror");
-        let want = now_ms + lifetime_ms as u64;
-        for e in &put_expiries {
-            assert_eq!(
-                *e, want,
-                "re-mirror must reuse the receiver-anchored expiry (now+lifetime), \
-                 not created_at(0)+lifetime={}",
-                lifetime_ms
-            );
-            assert!(
-                *e > now_ms,
-                "expiry is in the FUTURE from the receiver clock, not ~1970"
-            );
-        }
-    }
-
-    #[test]
-    fn set_copies_remirror_uses_receiver_anchored_expiry() {
-        // stores-r2-01 twin: the retransmit set_copies path re-mirrors too, and must also carry the
-        // receiver-anchored expiry rather than the sender's advisory created_at.
-        let mirror = FakeMirror::default();
-        let ops = mirror.ops.clone();
-        let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
-
-        let lifetime_ms: u32 = 7_200_000; // 2h
-        let now_ms: u64 = 12_000_000_000;
-        let b = sample_with(4, /*created_at=*/ 0, lifetime_ms);
-        let id = b.id();
-        assert!(store.put(b, now_ms));
-        store.set_copies(&id, 2);
-        assert!(store.flush(std::time::Duration::from_secs(5)));
-
-        let want = now_ms + lifetime_ms as u64;
-        let recorded = ops.lock().unwrap().clone();
-        let last_put = recorded
-            .iter()
-            .rev()
-            .find_map(|op| match op {
-                MirrorOp::Put { id: i, expires_at } if *i == id => Some(*expires_at),
-                _ => None,
-            })
-            .expect("set_copies re-mirrored a put");
-        assert_eq!(
-            last_put, want,
-            "set_copies re-mirror uses the receiver-anchored expiry"
-        );
-    }
-
-    #[test]
     fn put_clamps_durable_expiry_and_rehydrate_bounds_a_hostile_window() {
         // stores-r2-03: a §39 bundle with a hostile ~49-day lifetime_ms must not write a 49-day
         // durable expiresAt (clamp on the write side to MAX_SEEN_LIFETIME_MS), AND a doc that
@@ -6109,39 +5992,6 @@ mod tests {
             puts.len(),
             1,
             "a deduped put must mirror exactly once, not twice"
-        );
-    }
-
-    #[test]
-    fn split_copies_at_one_does_not_remirror() {
-        // split_copies returns 0 when the budget is 1 (nothing to hand out). remirror() must be
-        // skipped in that case -- a spurious re-mirror of an un-split bundle is wasted durable I/O.
-        let mirror = FakeMirror::default();
-        let ops = mirror.ops.clone();
-        let mut store = FirestoreStore::open_with_mirror(mirror).unwrap();
-
-        let b = sample(1); // single copy: split hands out floor(1/2) = 0
-        let id = b.id();
-        assert!(store.put(b, 1_000));
-        assert!(store.flush(Duration::from_secs(5)));
-        let puts_before = ops
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|op| matches!(op, MirrorOp::Put { .. }))
-            .count();
-
-        assert_eq!(store.split_copies(&id), 0, "a 1-copy bundle splits to 0");
-        assert!(store.flush(Duration::from_secs(5)));
-        let puts_after = ops
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|op| matches!(op, MirrorOp::Put { .. }))
-            .count();
-        assert_eq!(
-            puts_before, puts_after,
-            "split_copies==0 must NOT re-mirror the bundle"
         );
     }
 
