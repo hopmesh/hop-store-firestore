@@ -592,7 +592,7 @@ impl FirestoreStore {
         self.startup_cleanup_pending.load(Ordering::Acquire) != 0
     }
 
-    /// stores-r2-01: re-mirror an already-held bundle (after a spray-and-wait split or a retransmit
+    /// stores-r2-01: re-mirror an already-held bundle (after a retransmit
     /// handoff) reusing the RECEIVER-anchored `expires_at` this store recorded at `put` time,
     /// NOT `created_at + lifetime_ms`. `created_at` is the SENDER's advisory clock (§8, defaults to
     /// 0): re-deriving from it can rewrite the durable doc's `expireAt` into the past (created_at=0
