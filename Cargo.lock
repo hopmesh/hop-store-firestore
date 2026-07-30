@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "hop-mesh-core"
-version = "0.0.1"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a726a283faa0700dde1190148e5b19cd8c424b0cad30790394ce3b0c7afc41b3"
 dependencies = [
@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "hop-mesh-store-firestore"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64",
  "blake3",

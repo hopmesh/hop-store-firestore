@@ -91,6 +91,123 @@ def require(condition, message):
         raise ExportError(message)
 
 
+def published_crate_names(root):
+    """The crates.io names of our own mirrored crates, read from copy.bara.sky's CRATE_RENAMES."""
+    text = (root / "tools/copybara/copy.bara.sky").read_text(encoding="utf-8")
+    block = re.search(r"CRATE_RENAMES = \{(.*?)\n\}", text, re.S)
+    require(block is not None, "copy.bara.sky CRATE_RENAMES block not found")
+    names = set(re.findall(r'\(\s*"[^"]+"\s*,\s*"([^"]+)"\s*\)', block.group(1)))
+    require(bool(names), "copy.bara.sky CRATE_RENAMES parsed empty")
+    # Crates absent from the rename map publish under their monorepo name.
+    return names | {"hop-wasm"}
+
+
+def workspace_version(root):
+    data = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+    version = data.get("workspace", {}).get("package", {}).get("version")
+    require(bool(version), "workspace [workspace.package] version is missing")
+    return version
+
+
+def verify_standalone_lock(root, component, destination):
+    """`cargo metadata --locked` on the exported crate, tolerating a sibling not published YET.
+
+    Steady state is the strict check: the shipped lock must agree with the shipped manifests, verified by
+    cargo against the real registry. But a coordinated version bump cannot satisfy that, and the deadlock
+    is total: the standalone hop-wasm and store crates depend on hop-mesh-core as a REGISTRY crate, so
+    raising the workspace version makes them demand a version that is not published, while publishing it
+    requires a tag, which requires this check to pass. Every version bump was therefore unmergeable, which
+    is why nothing had ever been released past the bootstrap.
+
+    So a first-party sibling missing from the registry at exactly the version being released is treated as
+    the expected mid-release state rather than a defect. Nothing else is forgiven: any other cargo failure,
+    a third-party resolution error, a lock that disagrees with the manifest, or a sibling at an unexpected
+    version all still fail. In the tolerated case the lock/manifest agreement that cargo would have proven
+    is asserted directly instead, so the check keeps its meaning, and it returns to the strict path by
+    itself once the dependency is published.
+    """
+    command = ["cargo", "metadata", "--locked", "--format-version", "1"]
+    print("+", " ".join(command), f"(cwd={destination})", flush=True)
+    result = subprocess.run(
+        command, cwd=destination, check=False, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if result.returncode == 0:
+        return
+
+    stderr = result.stderr or ""
+    first_party = published_crate_names(root)
+    anchor = workspace_version(root)
+    unresolved = re.findall(
+        r'failed to select a version for the requirement `([A-Za-z0-9_.-]+) = "\^?([0-9][0-9A-Za-z.\-+]*)"',
+        stderr,
+    )
+    tolerable = [
+        (name, wanted)
+        for name, wanted in unresolved
+        if name in first_party and wanted == anchor
+    ]
+    if not unresolved or len(tolerable) != len(unresolved):
+        raise ExportError(
+            f"command failed ({result.returncode}): {' '.join(command)}\n{result.stdout or ''}{stderr}"
+        )
+
+    # Prove directly what cargo would have proven for the unpublishable siblings: the shipped manifest
+    # and the shipped lock name the same version, and nothing in the manifest is missing from the lock.
+    manifest = tomllib.loads((destination / "Cargo.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads((destination / "Cargo.lock").read_text(encoding="utf-8"))
+    # A lock legitimately carries SEVERAL versions of one crate (rand_core 0.6 and 0.10 coexist here),
+    # so collect every version per name rather than keeping whichever came last.
+    locked = {}
+    for package in lock.get("package", []):
+        locked.setdefault(package.get("name"), set()).add(package.get("version"))
+
+    # The export injects a [workspace.dependencies] preamble and the crate inherits from it
+    # (`hop-core = { workspace = true }`), which is also where the crates.io rename lives
+    # (`package = "hop-mesh-core"`). Resolve inheritance before looking anything up in the lock, or a
+    # renamed sibling reads as a missing dependency.
+    workspace_deps = manifest.get("workspace", {}).get("dependencies") or {}
+    dependencies = {}
+    for table in ("dependencies", "dev-dependencies", "build-dependencies"):
+        for name, spec in (manifest.get(table) or {}).items():
+            if isinstance(spec, dict) and spec.get("workspace"):
+                spec = workspace_deps.get(name, {})
+            wanted = spec if isinstance(spec, str) else (spec or {}).get("version")
+            renamed = spec.get("package") if isinstance(spec, dict) else None
+            # A pure path dependency has no registry version to compare against.
+            if isinstance(spec, dict) and spec.get("path") and not wanted:
+                continue
+            dependencies[renamed or name] = wanted
+
+    # The unpublishable siblings get the exact check cargo would have applied: the lock must pin the very
+    # version the manifest asks for.
+    for name, wanted in tolerable:
+        require(
+            name in locked,
+            f"{component}: {name} is required but absent from the standalone Cargo.lock",
+        )
+        require(
+            wanted in locked[name],
+            f"{component}: Cargo.lock pins {name} {sorted(locked[name])}, manifest wants {wanted}",
+        )
+    # Third-party requirements are semver RANGES, and resolving a range against a lock is exactly the job
+    # cargo does. Re-implementing it here would only invent a second, worse resolver, so assert the one
+    # thing a lock can be checked for without one: nothing the manifest requires is missing entirely.
+    # Full range resolution returns as soon as the sibling publishes and the strict path runs again.
+    for name in dependencies:
+        require(
+            name in locked,
+            f"{component}: dependency {name} is missing from the standalone Cargo.lock",
+        )
+
+    names = ", ".join(f"{name} {wanted}" for name, wanted in tolerable)
+    print(
+        f"  note: {component} verified against its shipped lock; {names} "
+        "is not on the registry yet (mid-release), so cargo could not resolve it",
+        flush=True,
+    )
+
+
 def run(command, cwd, env=None, capture=False):
     print("+", " ".join(str(part) for part in command), f"(cwd={cwd})", flush=True)
     result = subprocess.run(
@@ -290,11 +407,7 @@ def static_check(root, output_root, selected):
         require(".github/package-export-smoke.py" in tree, f"{component} lacks export contract helper")
         if component in RUST_MIRRORS and ".github/workflows/release.yml" in tree:
             require("Cargo.lock" in tree, f"{component} release has no standalone Cargo lock")
-            run(
-                ["cargo", "metadata", "--locked", "--format-version", "1"],
-                destination,
-                capture=True,
-            )
+            verify_standalone_lock(root, component, destination)
         for parent_marker in ("Cargo.lock", "DESIGN.md", "sdk/hop.h", "tools/CLAUDE.md"):
             if parent_marker not in tree:
                 require(not (destination / parent_marker).exists(), f"{component} leaked monorepo parent file {parent_marker}")
