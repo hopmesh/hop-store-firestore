@@ -15,6 +15,7 @@ git-cliff. Do not edit by hand.
 - drop the root license, license per-component (FSL-1.1-ALv2) (#146) (be2a5a7)
 
 ### Documentation
+- regenerate from conventional commits (b96e019)
 - regenerate from conventional commits (330c8c6)
 - regenerate from conventional commits (096180b)
 - regenerate from conventional commits (102ae67)
@@ -31,6 +32,8 @@ git-cliff. Do not edit by hand.
 - the ledger source, closing the reconcile chain end to end (ba6b6b8)
 
 ### Other
+- bump our crates in every standalone/vendored Cargo.lock (aad3ff7)
+- make the writer-scoped ledger readable end to end, and stop overclaiming (5ee2555)
 - delete the dead copy-budget API and stop the simulator lying (9ab3138)
 - one-time prekeys for async first contact (wire v11) (d6ebce3)
 - publish the Rust crates under the hop-mesh-* namespace (3bb9d0c)
