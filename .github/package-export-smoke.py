@@ -25,6 +25,9 @@ GO_CGO_EXPORT = """#cgo pkg-config: hop
 """
 ELIXIR_HOP_PATH_DEP = 'hop = { path = "../../../../core/hop" }'
 ELIXIR_HOP_VENDOR_DEP = 'hop = { workspace = true }'
+OWNER = "hopmesh"
+MONOREPO_REPOSITORY = 'repository = "https://github.com/hopmesh/monorepo"'
+
 RUST_MIRRORS = {
     "hop-core",
     "libhop",
@@ -349,6 +352,17 @@ def expected_export_tree(source_root, component, components=None, available=None
     if component in RUST_MIRRORS:
         preamble = workspace_preamble(source_root / "tools/copybara/copy.bara.sky")
         replace_text(tree, "Cargo.toml", "[package]\n", preamble, f"{component} workspace injection")
+        # The shared preamble can only name one repository and it names the private monorepo, which is
+        # a dead link for anyone who installs the package AND makes npm reject hop-wasm, since its
+        # sigstore provenance attests to the mirror. Point each crate at its own mirror; copy.bara.sky
+        # applies the same rewrite (and reverses it on import before stripping the preamble).
+        replace_text(
+            tree,
+            "Cargo.toml",
+            MONOREPO_REPOSITORY,
+            f'repository = "https://github.com/{OWNER}/{component}"',
+            f"{component} mirror repository",
+        )
     return tree
 
 
