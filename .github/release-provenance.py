@@ -6,6 +6,7 @@ import base64
 import importlib.util
 import json
 import os
+import posixpath
 import re
 import shutil
 import stat
@@ -324,9 +325,18 @@ def extract_archive(archive, destination):
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             if member.issym():
+                # Reject only what is actually unsafe: an absolute target, or a relative one that
+                # escapes the archive root. The previous test rejected any target CONTAINING "..",
+                # without normalizing first, so a legitimate in-tree link was refused as well:
+                # .claude/skills/hop-adversarial-audit -> ../../.agents/skills/hop-adversarial-audit
+                # resolves to .agents/skills/hop-adversarial-audit, comfortably inside the tree, yet the
+                # unnormalized join still contained "..". That blocked EVERY component's publish the
+                # moment such a link was committed. Normalize, then require the result to stay inside.
                 link = PurePosixPath(member.linkname)
-                resolved = PurePosixPath(*parts[:-1], link)
-                if link.is_absolute() or ".." in resolved.parts:
+                joined = posixpath.join(posixpath.join(*parts[:-1]) if parts[:-1] else "", member.linkname)
+                resolved = posixpath.normpath(joined)
+                escapes = resolved == ".." or resolved.startswith("../") or posixpath.isabs(resolved)
+                if link.is_absolute() or escapes:
                     raise ProvenanceError("canonical source archive contains an unsafe symlink")
                 target.symlink_to(member.linkname)
                 continue
