@@ -3885,8 +3885,9 @@ impl Presence {
 
 /// A read-only view over every node partition's durable kv, for the §37 billing reconciler:
 /// it enumerates the node partitions under `relays/` and lists each one's kv pairs so the
-/// reconciler can collect the `usage/{hour}/{tenant}` and `telemetry_usage/{hour}/{tenant}`
-/// ledger rows the relays and telemetry collectors merge off their hot paths.
+/// reconciler can collect the `usage/{hour}/{tenant}/{writer}` and
+/// `telemetry_usage/{hour}/{tenant}/{writer}` ledger rows the relays and telemetry collectors merge
+/// off their hot paths.
 ///
 /// Pure reads (`documents.list`), satisfied by `roles/datastore.viewer`; wakes no node. The
 /// same auth scheme as every reader here: `FIRESTORE_ACCESS_TOKEN` env (local) or the
