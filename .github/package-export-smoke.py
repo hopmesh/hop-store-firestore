@@ -1055,6 +1055,28 @@ def write_android_application(project, dependency, source, repository=None, reso
         "        sourceCompatibility = JavaVersion.VERSION_1_8\n"
         "        targetCompatibility = JavaVersion.VERSION_1_8\n"
         "    }\n"
+        # Below, validate_android_export asserts the APK's libhop.so is BYTE-IDENTICAL to the AAR's.
+        # That is the point of the check: it proves the published native library reaches a consumer
+        # unmodified. But the libraries we publish are NOT stripped, and AGP runs stripDebugDebugSymbols
+        # during packaging, which rewrites them. Measured against the real published arm64-v8a slice
+        # with AGP 9.2.1 + NDK 27.1: 5,045,168 bytes in the AAR against 3,949,848 in the APK. So the
+        # assertion could never hold and the first real release failed on it.
+        #
+        # It went unnoticed because validate-android-export runs ONLY in the mirror's release workflow,
+        # never in monorepo CI, so the check first executed during an actual publish.
+        #
+        # Keep the strong assertion and remove the transformation rather than weakening the test: tell
+        # AGP not to strip this library in the throwaway verification consumer. Do not delete this
+        # block. Without it the strip returns and the Android release fails again at publish time.
+        #
+        # Note when reproducing locally: AGP silently SKIPS the strip when no NDK is configured
+        # ("Unable to strip the following libraries, packaging them as they are"), which makes an
+        # unfixed build look like it passes. A local repro needs ndkVersion set, as CI's runner has.
+        "    packaging {\n"
+        "        jniLibs {\n"
+        '            keepDebugSymbols += "**/libhop.so"\n'
+        "        }\n"
+        "    }\n"
         "}\n"
         "kotlin { compilerOptions { jvmTarget.set(JvmTarget.JVM_1_8) } }\n\n"
         f"dependencies {{ {dependency} }}\n"
