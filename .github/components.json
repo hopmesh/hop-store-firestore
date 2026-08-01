@@ -7,6 +7,7 @@
   "hop-sdk-elixir": {"prefix": "sdk/elixir"},
   "hop-sdk-apple": {"prefix": "sdk/apple"},
   "hop-sdk-android": {"prefix": "sdk/android"},
+  "hop-sdk-react-native": {"prefix": "sdk/react-native"},
   "hop-embedded": {"prefix": "sdk/embedded"},
   "hop-core": {"prefix": "core/hop-core", "rust": true, "rename": ["hop-core", "hop-mesh-core"]},
   "libhop": {"prefix": "core/hop", "rust": true, "rename": ["hop", "libhop"]},
