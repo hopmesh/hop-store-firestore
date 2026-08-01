@@ -29,7 +29,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 name = "hop-mesh-store-firestore"
 version.workspace = true
 edition.workspace = true
-license-file = "LICENSE.md"
+license = "Apache-2.0"
 repository.workspace = true
 description = "Durable per-node Hop Store backed by Firestore (survives scale-to-zero, DESIGN.md §19/§21)."
 
