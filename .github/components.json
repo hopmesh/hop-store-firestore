@@ -5,6 +5,7 @@
   "hop-sdk-ruby": {"prefix": "sdk/ruby"},
   "hop-sdk-crystal": {"prefix": "sdk/crystal"},
   "hop-sdk-elixir": {"prefix": "sdk/elixir"},
+  "hop-sdk-flutter": {"prefix": "sdk/flutter"},
   "hop-sdk-apple": {"prefix": "sdk/apple"},
   "hop-sdk-android": {"prefix": "sdk/android"},
   "hop-embedded": {"prefix": "sdk/embedded"},
