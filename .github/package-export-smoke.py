@@ -890,6 +890,23 @@ def package_checksum(package):
     return run(["swift", "package", "compute-checksum", package], package.parent, capture=True)
 
 
+def pinned_abi_version(export):
+    """The C-ABI level the Apple package under validation pins, read from the package itself.
+
+    PLAT-004: this check used to hard-code 4 while the ABI was 5, and no guard compared the two, so the
+    gate either failed the next Apple release for the wrong reason or was proven never to run against a
+    real artifact. A duplicated constant is the defect, so derive it. The Swift wrapper's
+    `expectedABIVersion` is the right authority: it is what the published package compiles in and
+    asserts at load, so "the xcframework header agrees with the wrapper shipped beside it" is exactly
+    the property this gate should hold, and it holds it in the mirrored hop-sdk-apple repo too, where
+    core/hop/src/cabi.rs does not exist.
+    """
+    swift = (export / "Sources/Hop/Hop.swift").read_text(encoding="utf-8")
+    found = re.search(r"expectedABIVersion:\s*UInt32\s*=\s*(\d+)", swift)
+    require(found is not None, "Apple package does not declare expectedABIVersion")
+    return int(found.group(1))
+
+
 def validate_apple(export, work, bundle):
     dumped = run(["swift", "package", "dump-package"], export, capture=True)
     manifest = json.loads(dumped)
@@ -928,7 +945,11 @@ def validate_apple(export, work, bundle):
         headers = [source.read(f"libhop.xcframework/{slice_name}/Headers/hop.h") for slice_name in slices]
         module_maps = [source.read(f"libhop.xcframework/{slice_name}/Headers/module.modulemap") for slice_name in slices]
     require(len(set(headers)) == 1, "Apple xcframework slice headers differ")
-    require(b"#define HOP_ABI_VERSION 4\n" in headers[0], "Apple xcframework does not expose ABI 4")
+    abi = pinned_abi_version(export)
+    require(
+        f"#define HOP_ABI_VERSION {abi}\n".encode() in headers[0],
+        f"Apple xcframework header does not expose the level the shipped wrapper pins ({abi})",
+    )
     require(len(set(module_maps)) == 1 and b"module CHop {" in module_maps[0], "Apple xcframework module maps differ")
     run(["python3", "install-local-xcframework.py", "--version", "v0.0.1", "--bundle", bundle], export)
     frameworks = export / "Frameworks"
