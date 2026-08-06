@@ -5,6 +5,8 @@ git-cliff. Do not edit by hand.
 ## Unreleased
 
 ### Bug Fixes
+- refresh the hop-store-firestore standalone lock for the base64 bump (e13d67a)
+- rustfmt drift and two overstated lines in the sec-relay-p1 write-up (b25d258)
 - per-mirror repository, and retryable release artifacts (bf04449)
 - refresh standalone lock checksums for the published sibling (b123888)
 - cover Destination::Vaccine in every workspace crate (relay/relayd/hop-sim) + workspace fmt/clippy (e611c4d)
@@ -13,11 +15,14 @@ git-cliff. Do not edit by hand.
 - bump create-github-app-token to v3.2.0 across all mirrored components (efc9f6c)
 
 ### Chore
+- bump the rust-dependencies group across 1 directory with 7 updates (ce964ad)
 - invert the license tiers, FSL moves from core to services (14d7fec)
 - purge em-dashes and en-dashes from source (d222435)
 - drop the root license, license per-component (FSL-1.1-ALv2) (#146) (be2a5a7)
 
 ### Documentation
+- record the relay link-identity gap, and what sec-relay-p1 did and did not close (951093a)
+- regenerate from conventional commits (3b47a5f)
 - regenerate from conventional commits (ffb2acb)
 - regenerate from conventional commits (e19ed95)
 - regenerate from conventional commits (7a81fb6)
@@ -40,6 +45,8 @@ git-cliff. Do not edit by hand.
 - the ledger source, closing the reconcile chain end to end (ba6b6b8)
 
 ### Other
+- close SVC-002, SVC-003 and SVC-004 (5081fc2)
+- key the presence index, de-fingerprint the delivery vaccine (e25fff5)
 - bump our crates in every standalone/vendored Cargo.lock (aad3ff7)
 - make the writer-scoped ledger readable end to end, and stop overclaiming (5ee2555)
 - delete the dead copy-budget API and stop the simulator lying (9ab3138)
