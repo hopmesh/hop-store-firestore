@@ -3528,10 +3528,72 @@ fn parse_tenant_doc(d: &serde_json::Value) -> Option<TenantRecord> {
 /// A device's last-known region, learned from where it checked in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DevicePresence {
-    /// base58 device address.
-    pub device: String,
+    /// The [`PresenceIndex`] this record is filed under. NOT a device address: the address
+    /// cannot be recovered from it without the fleet key (see [`PresenceKey`]).
+    pub index: String,
     pub region: String,
     pub heartbeat_ms: u64,
+}
+
+/// The fleet-wide secret that keys the presence index (sec-relay-p1-01).
+///
+/// Derived from the relay fleet's shared base seed, the same secret every region already needs to
+/// derive peer regions' node addresses, so keying the index costs no new key distribution. Every
+/// relay derives the identical key, which is what lets region A file a check-in that region B can
+/// look up; nobody outside the fleet can derive it, which is the point.
+///
+/// This does NOT hide anything from the relay process itself. A relay authenticates every link
+/// peer's permanent address over Noise XX and therefore knows exactly whose presence it is writing
+/// (DESIGN.md §39, "What a relay still learns"). What the key removes is the durable, externally
+/// readable copy: a reader of the Firestore collection (an operator, a leaked credential, a backup,
+/// a legal demand served on the database rather than the fleet) no longer gets a plaintext
+/// directory of every online node's permanent hop address and its coarse location over time
+/// (DESIGN.md §33 calls that collection "the sharp one"). Keyed rather than plain-hashed: a hash of a
+/// 32-byte address is still a perfect membership oracle, since anyone holding a suspect's address
+/// (they are public, §23) could hash it and look it up. Without the fleet key, neither enumeration
+/// nor a targeted membership test works.
+#[derive(Clone)]
+pub struct PresenceKey([u8; 32]);
+
+impl PresenceKey {
+    /// Derive the presence-index key from the fleet's shared base seed.
+    pub fn from_fleet_seed(fleet_seed: &[u8; 32]) -> Self {
+        // derive_key domain-separates: the index key is a distinct key from the seed itself, so a
+        // presence index can never be replayed as identity material (or vice versa).
+        Self(blake3::derive_key("hop presence index key v1", fleet_seed))
+    }
+}
+
+impl std::fmt::Debug for PresenceKey {
+    /// Redacted: this is key material and relay logs are shipped off-box.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PresenceKey(redacted)")
+    }
+}
+
+/// The opaque document id a device's presence record is filed under: a keyed hash of its address.
+///
+/// A newtype, not a `&str`, ON PURPOSE. The whole value of sec-relay-p1-01 is that NO code path
+/// writes a device address into the presence collection, and the only way to keep that true as the
+/// code changes is to make an address unusable as a key: [`Presence::set_presence`] and
+/// [`Presence::region_of`] accept this type and nothing else. Both sides of a cross-region lookup
+/// derive it from the address they already hold (the writer from its link peer, the reader from the
+/// bundle's cleartext destination), so routing is unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresenceIndex(String);
+
+impl PresenceIndex {
+    /// Index a device address under the fleet key.
+    pub fn of(key: &PresenceKey, device_addr: &[u8]) -> Self {
+        let mut hasher = blake3::Hasher::new_keyed(&key.0);
+        hasher.update(b"hop presence index v1");
+        hasher.update(device_addr);
+        Self(bs58::encode(hasher.finalize().as_bytes()).into_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// The presence index + cross-partition write plane.
@@ -3544,6 +3606,9 @@ pub struct DevicePresence {
 ///
 /// Presence is a passive Firestore write/read: looking up a device's region **wakes no
 /// node**, only the destination region's own clients ever wake it (DESIGN.md §28).
+///
+/// sec-relay-p1-01: the collection is keyed by [`PresenceIndex`], not by device address. See
+/// [`PresenceKey`] for what that does and does not buy.
 pub struct Presence {
     http: reqwest::blocking::Client,
     project: String,
@@ -3576,10 +3641,18 @@ impl Presence {
         cached_token(&self.token, &self.http)
     }
 
-    /// Record that `device` (base58) checked in from `region`. Idempotent upsert.
-    pub fn set_presence(&self, device: &str, region: &str, now_ms: u64) -> Result<(), String> {
-        let url = format!("{}/{}", self.presence_url, device);
-        let body = presence_doc_json(device, region, now_ms);
+    /// Record that the device behind `index` checked in from `region`. Idempotent upsert.
+    ///
+    /// sec-relay-p1-01: takes a [`PresenceIndex`], never an address, so the collection holds no
+    /// device address in either the document id or its fields.
+    pub fn set_presence(
+        &self,
+        index: &PresenceIndex,
+        region: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let url = format!("{}/{}", self.presence_url, index.as_str());
+        let body = presence_doc_json(index.as_str(), region, now_ms);
         let token = self.token()?;
         let resp = self
             .http
@@ -3595,15 +3668,18 @@ impl Presence {
         }
     }
 
-    /// Where was `device` (base58) last seen, if its check-in is still fresh within
+    /// Where was the device behind `index` last seen, if its check-in is still fresh within
     /// `ttl_ms`? A pure read, wakes no node. `Ok(None)` means unknown or stale.
+    ///
+    /// The caller derives `index` from the destination address it already holds (a `Device`
+    /// bundle names it in cleartext), so keying the collection costs the lookup nothing.
     pub fn region_of(
         &self,
-        device: &str,
+        index: &PresenceIndex,
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<Option<String>, String> {
-        let url = format!("{}/{}", self.presence_url, device);
+        let url = format!("{}/{}", self.presence_url, index.as_str());
         let token = self.token()?;
         let resp = self
             .http
@@ -4019,10 +4095,13 @@ impl KvReader {
 /// collection being an indefinitely-retained per-address→region location log (DESIGN §33).
 const PRESENCE_DOC_TTL_MS: u64 = 3_600_000; // 1h
 
-fn presence_doc_json(device: &str, region: &str, heartbeat_ms: u64) -> serde_json::Value {
+/// Body of a presence document. `index` is a [`PresenceIndex`] string, never a device address
+/// (sec-relay-p1-01): the field is named for what it holds so a future reader is not tempted to
+/// treat it as one.
+fn presence_doc_json(index: &str, region: &str, heartbeat_ms: u64) -> serde_json::Value {
     serde_json::json!({
         "fields": {
-            "device": { "stringValue": device },
+            "index": { "stringValue": index },
             "region": { "stringValue": region },
             "heartbeatAt": { "integerValue": heartbeat_ms.to_string() },
             // F-20: timestampValue the Firestore TTL policy sweeps on, so presence self-expires.
@@ -4035,7 +4114,7 @@ fn presence_doc_json(device: &str, region: &str, heartbeat_ms: u64) -> serde_jso
 fn parse_presence_doc(d: &serde_json::Value) -> Option<DevicePresence> {
     let f = d.get("fields")?;
     Some(DevicePresence {
-        device: f["device"]["stringValue"].as_str()?.to_string(),
+        index: f["index"]["stringValue"].as_str()?.to_string(),
         region: f["region"]["stringValue"].as_str()?.to_string(),
         heartbeat_ms: f["heartbeatAt"]["integerValue"]
             .as_str()
@@ -5873,12 +5952,70 @@ mod tests {
 
     #[test]
     fn presence_doc_round_trips() {
-        let json = presence_doc_json("Dev9", "europe-north1", 4242);
+        let json = presence_doc_json("Idx9", "europe-north1", 4242);
         let doc = serde_json::json!({ "name": "x", "fields": json["fields"] });
         let p = parse_presence_doc(&doc).expect("parse");
-        assert_eq!(p.device, "Dev9");
+        assert_eq!(p.index, "Idx9");
         assert_eq!(p.region, "europe-north1");
         assert_eq!(p.heartbeat_ms, 4242);
+    }
+
+    #[test]
+    fn presence_index_hides_the_address_and_still_round_trips_for_the_fleet() {
+        // sec-relay-p1-01. The presence collection is the sharpest thing the backbone persists
+        // (DESIGN.md §33): a device address mapped to a coarse location over time. Keying it means
+        // three properties must all hold at once, and each one is a way the keying could be useless.
+        let fleet = PresenceKey::from_fleet_seed(&[7u8; 32]);
+        let other_fleet = PresenceKey::from_fleet_seed(&[8u8; 32]);
+        let alice = [0xa1u8; 32];
+        let bob = [0xb2u8; 32];
+
+        // 1. AGREEMENT. Every relay derives the same key from the shared seed, so the region that
+        // writes a check-in and the region that later reads it land on the same document. Without
+        // this, cross-region handoff (§28) silently stops working.
+        let again = PresenceKey::from_fleet_seed(&[7u8; 32]);
+        assert_eq!(
+            PresenceIndex::of(&fleet, &alice),
+            PresenceIndex::of(&again, &alice),
+            "the same fleet seed must index a device identically in every region"
+        );
+
+        // 2. SEPARATION. Distinct devices get distinct documents (routing correctness), and a
+        // different fleet key indexes the same device elsewhere (one leaked deployment's index does
+        // not unlock another's).
+        assert_ne!(
+            PresenceIndex::of(&fleet, &alice),
+            PresenceIndex::of(&fleet, &bob)
+        );
+        assert_ne!(
+            PresenceIndex::of(&fleet, &alice),
+            PresenceIndex::of(&other_fleet, &alice)
+        );
+
+        // 3. NO ADDRESS ON THE WIRE OR AT REST. Neither the document id nor the body may contain
+        // the address in any encoding a reader would recognize.
+        let index = PresenceIndex::of(&fleet, &alice);
+        let b58 = bs58::encode(alice).into_string();
+        let hex: String = alice.iter().map(|b| format!("{b:02x}")).collect();
+        let body = presence_doc_json(index.as_str(), "eu-west1", 1_000).to_string();
+        for encoding in [&b58, &hex] {
+            assert!(
+                !index.as_str().contains(encoding.as_str()),
+                "the presence index must not embed the address"
+            );
+            assert!(
+                !body.contains(encoding.as_str()),
+                "the presence document must not embed the address"
+            );
+        }
+    }
+
+    #[test]
+    fn presence_key_debug_is_redacted() {
+        // Relay logs ship off-box; the fleet key is the one secret that would re-open the whole
+        // presence collection to whoever read the log line.
+        let key = PresenceKey::from_fleet_seed(&[3u8; 32]);
+        assert_eq!(format!("{key:?}"), "PresenceKey(redacted)");
     }
 
     #[test]
@@ -6635,7 +6772,7 @@ mod tests {
         // F-20 twin for presence: the location record must self-expire via an `expireAt`
         // timestampValue at heartbeat + PRESENCE_DOC_TTL_MS (DESIGN §33: no indefinite location log).
         let hb: u64 = 1_700_000_000_000;
-        let json = presence_doc_json("Dev1", "eu-west1", hb);
+        let json = presence_doc_json("Idx1", "eu-west1", hb);
         assert_eq!(
             json["fields"]["expireAt"]["timestampValue"],
             rfc3339_utc(hb + PRESENCE_DOC_TTL_MS),
@@ -7874,27 +8011,39 @@ mod tests {
     fn presence_set_presence_patches_and_maps_errors() {
         let srv = spawn_mock(vec![(200, "{}".into())]);
         let presence = presence_at(&srv.base);
-        assert!(presence.set_presence("Dev1", "eu-west1", 5_000).is_ok());
+        let key = PresenceKey::from_fleet_seed(&[1u8; 32]);
+        let index = PresenceIndex::of(&key, &[0xd1u8; 32]);
+        assert!(presence.set_presence(&index, "eu-west1", 5_000).is_ok());
         {
             let reqs = srv.requests.lock().unwrap();
             assert_eq!(reqs[0].method, "PATCH");
-            assert!(reqs[0].target.contains("/presence/Dev1"));
+            assert!(reqs[0]
+                .target
+                .contains(&format!("/presence/{}", index.as_str())));
+            // sec-relay-p1-01: the request that hits Firestore carries the index, never the address.
+            let address_b58 = bs58::encode([0xd1u8; 32]).into_string();
+            assert!(!reqs[0].target.contains(&address_b58));
+            assert!(!reqs[0].body.contains(&address_b58));
             let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
             assert_eq!(body["fields"]["region"]["stringValue"], "eu-west1");
         }
         let srv2 = spawn_mock(vec![(500, String::new())]);
-        assert!(presence_at(&srv2.base).set_presence("D", "r", 1).is_err());
+        assert!(presence_at(&srv2.base)
+            .set_presence(&index, "r", 1)
+            .is_err());
     }
 
     #[test]
     fn presence_region_of_returns_fresh_stale_and_missing() {
         let now = 2_000_000u64;
         let ttl = 90_000u64;
+        let key = PresenceKey::from_fleet_seed(&[2u8; 32]);
+        let index = PresenceIndex::of(&key, &[0xd2u8; 32]);
         let pdoc = |region: &str, hb: u64| {
             serde_json::json!({
                 "name": "x",
                 "fields": {
-                    "device": { "stringValue": "Dev1" },
+                    "index": { "stringValue": "Idx1" },
                     "region": { "stringValue": region },
                     "heartbeatAt": { "integerValue": hb.to_string() },
                 }
@@ -7904,26 +8053,31 @@ mod tests {
         // Fresh check-in -> Some(region).
         let srv = spawn_mock(vec![(200, pdoc("eu", now - 1_000))]);
         assert_eq!(
-            presence_at(&srv.base).region_of("Dev1", now, ttl).unwrap(),
+            presence_at(&srv.base).region_of(&index, now, ttl).unwrap(),
             Some("eu".to_string())
         );
+        // The lookup addresses the index document, so a reader of the Firestore audit log sees no
+        // address either (sec-relay-p1-01).
+        assert!(srv.requests.lock().unwrap()[0]
+            .target
+            .contains(index.as_str()));
         // Stale check-in -> None (offline, don't route there).
         let srv2 = spawn_mock(vec![(200, pdoc("eu", now - ttl - 1))]);
         assert_eq!(
-            presence_at(&srv2.base).region_of("Dev1", now, ttl).unwrap(),
+            presence_at(&srv2.base).region_of(&index, now, ttl).unwrap(),
             None
         );
         // 404 -> None (unknown device); a 500 -> Err.
         let srv404 = spawn_mock(vec![(404, String::new())]);
         assert_eq!(
             presence_at(&srv404.base)
-                .region_of("Dev1", now, ttl)
+                .region_of(&index, now, ttl)
                 .unwrap(),
             None
         );
         let srv500 = spawn_mock(vec![(500, String::new())]);
         assert!(presence_at(&srv500.base)
-            .region_of("Dev1", now, ttl)
+            .region_of(&index, now, ttl)
             .is_err());
     }
 
