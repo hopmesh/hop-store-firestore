@@ -19,7 +19,10 @@
 //!    exposes (DESIGN.md §25) for state that must survive a scale cycle but isn't a bundle:
 //!    forward-secret ratchet sessions, prekey secrets, pending content. Before stores-07 this was
 //!    memory-only on the relay, so a scale-to-zero dropped every relay-hosted session and forced a
-//!    re-secure churn against mobile peers; now it round-trips through the same mirror seam.
+//!    re-secure churn against mobile peers; now it round-trips through the same mirror seam. The
+//!    VALUES are opaque bytes; the KEYS are cleartext and indexed, which makes this collection a
+//!    durable device-identifier surface (SVC-004). It is inventoried, with the accepted exposure and
+//!    the reasoning, in DESIGN.md §33; `kv_doc_json` carries the short version.
 //!
 //! The dedup `seen` set stays in-memory (losing it across a scale cycle costs at most some
 //! re-flooding, which the receiver dedups; §7).
@@ -3123,6 +3126,17 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
 
 /// Build a Firestore document body for a kv pair: the original key (so `list_kv` recovers it
 /// exactly, since the doc id is a base58 of the key bytes) plus the opaque value as base64 bytes.
+///
+/// SVC-004: the `key` field is CLEARTEXT and Firestore indexes it, so `session/<base58 peer public
+/// key>` and `strm/<base58 sender public key>/...` are durable, listable device identifiers to anyone
+/// holding a read credential on this database, with no `expireAt` bounding how long they live. That is
+/// an ACCEPTED exposure, not an oversight: `query_kv_page` runs server-side range filters and an
+/// `orderBy` on this exact field and hands a key back as the pagination cursor, rehydration recovers
+/// the peer address by decoding the key, and hop-billingd parses `usage/` keys with a credential that
+/// must never hold relay key material. DESIGN.md section 33 records the full reasoning, what remains
+/// exposed, and what a real fix would have to redesign first. Do not "improve" this by hashing the key:
+/// a reader of this database also reads the bundle headers, which carry the addresses, so an unkeyed
+/// hash is reversible by dictionary and would only make the exposure look mitigated.
 fn kv_doc_json(key: &str, value: &[u8]) -> serde_json::Value {
     let b64 = base64::engine::general_purpose::STANDARD.encode(value);
     serde_json::json!({
