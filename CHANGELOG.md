@@ -21,6 +21,7 @@ git-cliff. Do not edit by hand.
 - drop the root license, license per-component (FSL-1.1-ALv2) (#146) (be2a5a7)
 
 ### Documentation
+- regenerate from conventional commits (7160289)
 - record the relay link-identity gap, and what sec-relay-p1 did and did not close (951093a)
 - regenerate from conventional commits (3b47a5f)
 - regenerate from conventional commits (ffb2acb)
